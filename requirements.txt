@@ -1,0 +1,17 @@
+
+# Backend framework
+fastapi
+uvicorn[standard]
+
+# Data validation and configuration
+pydantic
+pydantic-settings
+
+# Environment variables
+python-dotenv
+
+openai
+SQLAlchemy
+langgraph
+
+langgraph-checkpoint-postgres
