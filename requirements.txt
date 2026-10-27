@@ -15,3 +15,5 @@ SQLAlchemy
 langgraph
 
 langgraph-checkpoint-postgres
+
+apify-client
