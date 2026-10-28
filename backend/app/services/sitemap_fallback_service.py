@@ -25,7 +25,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, Field
 
-from ..schemas.enums import PageType
+from backend.app.schemas.enums import PageType
 from .homepage_service import HomepageFetchResult, fetch_homepage
 from .url_extractor_service import (
     CandidateURL,

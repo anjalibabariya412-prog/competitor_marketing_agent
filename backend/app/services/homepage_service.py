@@ -28,10 +28,7 @@ from apify_client import ApifyClient
 from apify_client.errors import ApifyApiError
 from pydantic import BaseModel, Field
 
-try:
-    from app.core.config import settings
-except ModuleNotFoundError:
-    from backend.app.core.config import settings
+from backend.app.core.config import settings
 
 logger = logging.getLogger(__name__)
 

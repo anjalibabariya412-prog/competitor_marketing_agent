@@ -12,31 +12,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-try:
-    from ..state import AgentState
-    from ...schemas.business_form import BusinessForm
-    from ...services.sitemap_fallback_service import (
-        WebsiteURLDiscoveryResult,
-        discover_website_urls,
-    )
-    from ...services.url_extractor_service import CandidateURL
-except (ImportError, ValueError):
-    try:
-        from app.agent.state import AgentState
-        from app.schemas.business_form import BusinessForm
-        from app.services.sitemap_fallback_service import (
-            WebsiteURLDiscoveryResult,
-            discover_website_urls,
-        )
-        from app.services.url_extractor_service import CandidateURL
-    except ModuleNotFoundError:
-        from backend.app.agent.state import AgentState
-        from backend.app.schemas.business_form import BusinessForm
-        from backend.app.services.sitemap_fallback_service import (
-            WebsiteURLDiscoveryResult,
-            discover_website_urls,
-        )
-        from backend.app.services.url_extractor_service import CandidateURL
+from ..state import AgentState
+from backend.app.schemas.business_form import BusinessForm
+from backend.app.services.sitemap_fallback_service import (
+    WebsiteURLDiscoveryResult,
+    discover_website_urls,
+)
+from backend.app.services.url_extractor_service import CandidateURL
 
 logger = logging.getLogger(__name__)
 

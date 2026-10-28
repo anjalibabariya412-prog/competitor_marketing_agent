@@ -25,7 +25,7 @@ from typing import Any, Literal
 from bs4 import BeautifulSoup, Tag
 from pydantic import BaseModel, Field
 
-from ..schemas.enums import PageType
+from backend.app.schemas.enums import PageType
 from .homepage_service import HomepageFetchResult
 
 logger = logging.getLogger(__name__)

@@ -35,26 +35,15 @@ from apify_client.errors import ApifyApiError
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, ConfigDict, Field
 
-try:
-    from app.core.config import settings
-    from app.schemas.enums import PageType
-    from app.schemas.scraped_data import ScrapedPage
-    from app.services.page_selection_service import (
-        PageSelectionResult,
-        SelectedPage,
-        WebsitePipelineResult,
-    )
-    from app.services.url_extractor_service import classify_page_type
-except ModuleNotFoundError:
-    from backend.app.core.config import settings
-    from backend.app.schemas.enums import PageType
-    from backend.app.schemas.scraped_data import ScrapedPage
-    from backend.app.services.page_selection_service import (
-        PageSelectionResult,
-        SelectedPage,
-        WebsitePipelineResult,
-    )
-    from backend.app.services.url_extractor_service import classify_page_type
+from backend.app.core.config import settings
+from backend.app.schemas.enums import PageType
+from backend.app.schemas.scraped_data import ScrapedPage
+from .page_selection_service import (
+    PageSelectionResult,
+    SelectedPage,
+    WebsitePipelineResult,
+)
+from .url_extractor_service import classify_page_type
 
 logger = logging.getLogger(__name__)
 

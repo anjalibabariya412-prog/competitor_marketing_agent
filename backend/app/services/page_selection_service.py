@@ -26,8 +26,8 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
-from ..core.config import settings
-from ..schemas.enums import PageType
+from backend.app.core.config import settings
+from backend.app.schemas.enums import PageType
 from .sitemap_fallback_service import WebsiteURLDiscoveryResult, discover_website_urls
 from .url_extractor_service import CandidateURL
 

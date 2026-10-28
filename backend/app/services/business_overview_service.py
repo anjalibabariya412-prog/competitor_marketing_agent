@@ -26,16 +26,10 @@ from typing import Any, Literal, Sequence
 from openai import AsyncOpenAI, OpenAIError
 from pydantic import BaseModel, ConfigDict, Field
 
-try:
-    from app.core.config import settings
-    from app.schemas.enums import FindingType, PageType
-    from app.schemas.scraped_data import Finding, ScrapedPage
-    from app.services.website_content_crawler_service import WebsiteCrawlResult
-except ModuleNotFoundError:
-    from backend.app.core.config import settings
-    from backend.app.schemas.enums import FindingType, PageType
-    from backend.app.schemas.scraped_data import Finding, ScrapedPage
-    from backend.app.services.website_content_crawler_service import WebsiteCrawlResult
+from backend.app.core.config import settings
+from backend.app.schemas.enums import FindingType, PageType
+from backend.app.schemas.scraped_data import Finding, ScrapedPage
+from .website_content_crawler_service import WebsiteCrawlResult
 
 logger = logging.getLogger(__name__)
 

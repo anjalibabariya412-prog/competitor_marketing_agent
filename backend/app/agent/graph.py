@@ -12,31 +12,13 @@ from __future__ import annotations
 
 import logging
 
-try:
-    from .nodes import (
-        business_overview_node,
-        page_selection_node,
-        url_discovery_node,
-        website_crawling_node,
-    )
-    from .state import AgentState
-except (ImportError, ValueError):
-    try:
-        from app.agent.nodes import (
-            business_overview_node,
-            page_selection_node,
-            url_discovery_node,
-            website_crawling_node,
-        )
-        from app.agent.state import AgentState
-    except ModuleNotFoundError:
-        from backend.app.agent.nodes import (
-            business_overview_node,
-            page_selection_node,
-            url_discovery_node,
-            website_crawling_node,
-        )
-        from backend.app.agent.state import AgentState
+from .nodes import (
+    business_overview_node,
+    page_selection_node,
+    url_discovery_node,
+    website_crawling_node,
+)
+from .state import AgentState
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
