@@ -6,7 +6,7 @@ deterministic fallback.
 
 Responsibilities:
 - Accept combined candidate URLs from `discover_website_urls()`.
-- Always use gpt-4o-mini for fast, cost-effective structured URL selection.
+- Use the shared canonical model configuration (`settings.LLM_MODEL`).
 - Prioritize core marketing intelligence: About, Products/Services, Pricing,
   Offers/Promotions, and Key Features/Value Propositions.
 - Enforce strict validation: every selected URL must exist in the candidate list,
@@ -33,8 +33,8 @@ from .url_extractor_service import CandidateURL
 
 logger = logging.getLogger(__name__)
 
-# Dedicated, fixed model identifier for structured page selection
-PAGE_SELECTION_MODEL: str = "gpt-4o-mini"
+# Canonical model identifier for structured page selection (configured via settings.LLM_MODEL)
+PAGE_SELECTION_MODEL: str = settings.LLM_MODEL
 
 # Default maximum number of pages to select for competitive analysis
 DEFAULT_MAX_SELECTED_PAGES: int = 8
@@ -311,8 +311,7 @@ async def select_pages_with_llm(
         candidates: Combined candidate URLs from URL discovery.
         website_url: Target business website URL.
         max_pages: Maximum number of pages to select.
-        model: Deprecated parameter preserved for backward compatibility.
-            Page selection always uses PAGE_SELECTION_MODEL ('gpt-4o-mini').
+        model: Optional LLM model identifier. Defaults to shared configuration (settings.LLM_MODEL).
 
     Returns:
         A populated :class:`PageSelectionResult` instance.
@@ -339,9 +338,8 @@ async def select_pages_with_llm(
         res.error_message = "OPENAI_API_KEY is set to a placeholder value."
         return res
 
-    # Page selection strictly uses gpt-4o-mini for cost-effective structured URL selection.
-    # settings.LLM_MODEL and any caller-provided model are ignored for this service.
-    selected_model = PAGE_SELECTION_MODEL
+    # Resolve LLM model identifier (defaults to shared settings.LLM_MODEL)
+    selected_model = model or settings.LLM_MODEL
 
     # 2. Build candidate lookups for fast, strict validation
     candidate_map: dict[str, CandidateURL] = {c.url: c for c in candidates}
@@ -485,8 +483,7 @@ async def discover_and_select_pages(
     Args:
         website_url: Target business website URL.
         max_pages: Maximum number of pages to select for scraping.
-        model: Deprecated parameter preserved for backward compatibility.
-            Page selection always uses PAGE_SELECTION_MODEL ('gpt-4o-mini').
+        model: Optional LLM model identifier. Defaults to shared configuration (settings.LLM_MODEL).
         min_priority_links: Minimum priority links before inspecting main content.
         force_sitemap: Force sitemap discovery even if homepage coverage is sufficient.
         timeout_seconds: Timeout for initial homepage fetch.
@@ -528,6 +525,7 @@ async def discover_and_select_pages(
         candidates=discovery_result.candidate_urls,
         website_url=discovery_result.base_url or website_url,
         max_pages=max_pages,
+        model=model,
     )
 
     final_urls = [page.url for page in selection_result.selected_pages]
