@@ -17,3 +17,5 @@ langgraph
 langgraph-checkpoint-postgres
 
 apify-client
+beautifulsoup4
+

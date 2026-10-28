@@ -45,10 +45,15 @@ class Settings(BaseSettings):
         ...,
         description="Secret API key for OpenAI.",
     )
-    OPENAI_MODEL: str = Field(
+    LLM_MODEL: str = Field(
         ...,
-        description="OpenAI model identifier (e.g. gpt-4o, gpt-4o-mini). Swappable from .env.",
+        description="Canonical shared LLM model identifier (e.g. gpt-4o, gpt-6-luna). Swappable from .env.",
     )
+
+    @property
+    def OPENAI_MODEL(self) -> str:
+        """Deprecated backward-compatible alias pointing to canonical LLM_MODEL."""
+        return self.LLM_MODEL
 
     # -------------------------------------------------------------------------
     # Web Scraping Settings & Limits
