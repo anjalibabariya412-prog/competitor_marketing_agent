@@ -46,22 +46,35 @@ DEFAULT_ACTOR_TIMEOUT_SECONDS = 120
 # Permanent errors (auth failure, bad URL) are NOT retried.
 MAX_TRANSIENT_RETRIES = 2
 
-# Substrings whose presence in HTML strongly indicates a CAPTCHA or access-denial.
-# Detection is intentionally lightweight; no bypass is attempted.
-_BLOCK_SIGNALS: tuple[str, ...] = (
+# Substrings whose presence in HTML indicates a CAPTCHA or access-denial.
+# Categorized into definitive challenge markers and ambiguous markers.
+_DEFINITIVE_BLOCK_SIGNALS: tuple[str, ...] = (
+    "please verify you are a human",
+    "verify you are human",
+    "verify that you are human",
+    "cf-challenge",          # Cloudflare challenge page
+    "checking your browser before accessing",
+    "attention required! | cloudflare",
+    "you have been blocked",
+    "why have i been blocked",
+    "security check to continue",
+    "complete the security check to continue",
+    "ddos-guard protection",
+)
+
+_AMBIGUOUS_BLOCK_SIGNALS: tuple[str, ...] = (
     "captcha",
     "g-recaptcha",
     "hcaptcha",
-    "cf-challenge",          # Cloudflare challenge page
     "access denied",
     "403 forbidden",
     "451 unavailable",
-    "you have been blocked",
     "bot detected",
-    "please verify you are a human",
     "ddos-guard",
     "ray id",                # Cloudflare Ray ID in error pages
 )
+
+_BLOCK_SIGNALS: tuple[str, ...] = _DEFINITIVE_BLOCK_SIGNALS + _AMBIGUOUS_BLOCK_SIGNALS
 
 # ---------------------------------------------------------------------------
 # pageFunction – JavaScript executed inside the Playwright browser context.
@@ -201,13 +214,30 @@ def _normalize_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _is_blocked_html(html: str) -> bool:
-    """Return True if the HTML content signals a CAPTCHA or access denial.
+    """Return True if the HTML content signals a genuine CAPTCHA or access denial.
 
-    Detection is based on well-known plain-text markers.  No bypass is
-    attempted; this function is for classification only.
+    Distinguishes active challenge pages from substantive pages that passively
+    mention reCAPTCHA in forms or footers, or discuss security.
     """
+    if not html:
+        return False
     lower = html.lower()
-    return any(signal in lower for signal in _BLOCK_SIGNALS)
+
+    # 1. Definitive challenge signatures are active blocks
+    if any(signal in lower for signal in _DEFINITIVE_BLOCK_SIGNALS):
+        return True
+
+    # 2. Ambiguous signals: true blocks on short challenge pages (< 4000 chars)
+    # or when present in <title> or <h1>
+    if any(signal in lower for signal in _AMBIGUOUS_BLOCK_SIGNALS):
+        if len(html.strip()) < 4000:
+            return True
+        if "<title>access denied" in lower or "<title>403 forbidden" in lower or "<title>just a moment" in lower:
+            return True
+        if "<h1>access denied" in lower or "<h1>403 forbidden" in lower:
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +332,7 @@ def _run_actor_sync(
             run_input=actor_input,
             run_timeout=timeout_delta,
             wait_duration=timeout_delta,
+            logger=None,
         )
 
         if run is None:

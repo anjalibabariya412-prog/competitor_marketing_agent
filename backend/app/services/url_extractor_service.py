@@ -274,9 +274,12 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
         return PageType.POLICY
 
     # 3. Pricing
-    pricing_keywords = {"pricing", "prices", "price", "plans", "packages", "rates", "subscription", "fees", "cost"}
+    pricing_keywords = {
+        "pricing", "prices", "price", "plans", "packages", "rates",
+        "subscription", "subscriptions", "fees", "cost", "tier", "tiers",
+    }
     if any(k in path_tokens for k in pricing_keywords) or any(
-        k in text for k in ("pricing", "plans", "rates", "subscription", "packages")
+        k in text for k in ("pricing", "plans", "rates", "subscription", "subscriptions", "packages")
     ):
         return PageType.PRICING
 
@@ -304,14 +307,14 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     # 6. Contact & Location
     contact_keywords = {
         "contact", "locations", "location", "reach", "quote", "appointment",
-        "book", "schedule", "offices", "find-us",
+        "book", "booking", "schedule", "offices", "find-us", "demo", "request-demo",
     }
     if any(k in path_tokens for k in contact_keywords) or any(
-        k in path for k in ("contact-us", "get-in-touch", "find-us", "request-quote", "book-online")
+        k in path for k in ("contact-us", "get-in-touch", "find-us", "request-quote", "book-online", "book-demo", "request-demo")
     ):
         return PageType.CONTACT
     if any(k in text for k in (
-        "contact", "get in touch", "locations", "find us", "reach us", "book an appointment", "request a quote"
+        "contact", "get in touch", "locations", "find us", "reach us", "book an appointment", "request a quote", "book demo", "request demo"
     )):
         return PageType.CONTACT
 
@@ -329,9 +332,10 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     product_keywords = {
         "product", "products", "shop", "store", "collection", "collections",
         "catalog", "catalogue", "merchandise", "items", "goods",
+        "features", "feature", "platform",
     }
     if any(k in path_tokens for k in product_keywords) or any(
-        k in text for k in ("product", "products", "shop", "store", "collection", "catalog")
+        k in text for k in ("product", "products", "shop", "store", "collection", "catalog", "features", "platform")
     ):
         return PageType.PRODUCT
 
@@ -339,9 +343,10 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     service_keywords = {
         "service", "services", "solution", "solutions", "offerings",
         "capabilities", "treatments", "consulting", "practice", "practices",
+        "use-case", "use-cases", "case-study", "case-studies",
     }
     if any(k in path_tokens for k in service_keywords) or any(
-        k in text for k in ("service", "services", "solution", "solutions", "what we do", "capabilities")
+        k in text for k in ("service", "services", "solution", "solutions", "what we do", "capabilities", "use cases", "case studies")
     ):
         return PageType.SERVICE
 

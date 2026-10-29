@@ -89,6 +89,10 @@ class Finding(BaseModel):
     statement: str = Field(..., description="Factual finding text or observation.")
     finding_type: FindingType = Field(..., description="Category classification of the finding.")
     source_url: str = Field(..., description="Source URL providing evidence for the finding.")
+    source_urls: list[str] = Field(
+        default_factory=list,
+        description="Multiple source URLs if the finding synthesizes evidence from several pages.",
+    )
     is_inferred: bool = Field(
         default=False,
         description="Whether the finding is an analytical inference rather than explicitly stated.",

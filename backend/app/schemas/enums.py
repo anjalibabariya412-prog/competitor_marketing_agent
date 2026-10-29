@@ -51,3 +51,26 @@ class FindingType(str, Enum):
     STRENGTH = "strength"
     WEAKNESS = "weakness"
     OTHER = "other"
+
+class OfferingType(str, Enum):
+    """Classification of commercial products, services, collections, and plans."""
+
+    PRODUCT = "product"
+    PRODUCT_VARIANT = "product_variant"
+    COLLECTION = "collection"
+    SERVICE = "service"
+    SERVICE_PACKAGE = "service_package"
+    SAAS_FEATURE = "saas_feature"
+    SUBSCRIPTION_PLAN = "subscription_plan"
+    BUNDLE = "bundle"
+    OTHER = "other"
+
+
+class PriceAvailability(str, Enum):
+    """Availability status of commercial pricing information."""
+
+    AVAILABLE = "available"
+    QUOTE_BASED = "quote_based"
+    FREE_TIER = "free_tier"
+    NOT_STATED = "not_stated"
+

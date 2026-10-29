@@ -74,6 +74,10 @@ class Settings(BaseSettings):
         default=8,
         description="Maximum number of pages to scrape per competitor site.",
     )
+    CRAWLER_ACTOR_TIMEOUT_SECONDS: int = Field(
+        default=240,
+        description="Maximum execution timeout in seconds for Apify website content crawler actor.",
+    )
     MAX_COMPETITORS: int = Field(
         default=5,
         description="Maximum total number of competitors to analyze.",

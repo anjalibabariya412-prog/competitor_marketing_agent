@@ -96,7 +96,7 @@ async def generate_business_overview_endpoint(
 
     # 4. Handle upstream website crawling or URL discovery failures (WAF block, connectivity, etc.)
     if (
-        (crawl_result is not None and crawl_result.status == "failed")
+        (crawl_result is not None and crawl_result.status == "failed" and not crawl_result.has_usable_content)
         or (
             discovery_result is not None
             and discovery_result.homepage_status == "failed"

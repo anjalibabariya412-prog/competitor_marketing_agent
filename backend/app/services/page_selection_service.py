@@ -1,33 +1,40 @@
 """OpenAI Page Selection Service.
 
-Evaluates discovered candidate website URLs and selects the most relevant pages
-for competitive marketing analysis using structured LLM output with a robust
-deterministic fallback.
+Evaluates discovered candidate website URLs and selects a balanced, representative
+set of pages for competitive marketing analysis using structured LLM output with a
+robust deterministic fallback.
 
 Responsibilities:
 - Accept combined candidate URLs from `discover_website_urls()`.
 - Use the shared canonical model configuration (`settings.LLM_MODEL`).
-- Prioritize core marketing intelligence: About, Products/Services, Pricing,
-  Offers/Promotions, and Key Features/Value Propositions.
+- Ensure balanced coverage across key business categories when available:
+  1. Homepage (identity, baseline positioning, core value proposition)
+  2. About / Company (background, credentials, brand story)
+  3. Products / Services (features, offerings, prioritizing target product if specified)
+  4. Pricing / Offers (plans, rates, discounts, promotional offers)
+  5. Contact / Booking (conversion, appointments, service access)
+  6. Supporting Context (FAQs, customer policies, case studies)
+- Adapt selection to different business models (e-commerce, service, SaaS, static).
 - Enforce strict validation: every selected URL must exist in the candidate list,
-  deduplicate selections, and never fabricate URLs.
-- Provide a deterministic priority-weighted fallback if LLM is unavailable,
-  unconfigured, or fails.
+  deduplicate selections, avoid variant crowding, and never fabricate URLs.
+- Provide a deterministic priority-budgeted fallback if LLM is unavailable,
+  unconfigured, fails, or returns incomplete/unbalanced results.
 - Expose a clean pipeline interface `discover_and_select_pages()` connecting
   discovery to selection for downstream scraping.
 """
 
 from __future__ import annotations
 
+from enum import Enum
 import logging
-import urllib.parse
+import re
 from typing import Any, Literal
+import urllib.parse
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from backend.app.core.config import settings
-import re
 from backend.app.agent.prompts import (
     PAGE_SELECTION_SYSTEM_PROMPT,
     PAGE_SELECTION_USER_PROMPT_TEMPLATE,
@@ -48,23 +55,35 @@ DEFAULT_MAX_SELECTED_PAGES: int = 8
 # Upper bound on candidate URLs sent to LLM prompt to keep latency and token costs minimal
 MAX_PROMPT_CANDIDATES: int = 60
 
+
 # ---------------------------------------------------------------------------
-# Priority Weights for Deterministic Fallback
+# Balanced Selection Categories & Priorities
 # ---------------------------------------------------------------------------
+
+class SelectionCategory(str, Enum):
+    """Broad selection categories for balanced competitive analysis."""
+
+    HOME = "home"
+    ABOUT = "about"
+    PRODUCT_SERVICE = "product_service"
+    PRICING_OFFER = "pricing_offer"
+    CONTACT_BOOKING = "contact_booking"
+    OTHER_RELEVANT = "other_relevant"
+
 
 PAGE_TYPE_PRIORITY: dict[PageType, int] = {
     PageType.PRICING: 100,
     PageType.PRODUCT: 90,
     PageType.SERVICE: 90,
     PageType.OFFER: 85,
-    PageType.ABOUT: 75,
-    PageType.FAQ: 60,
-    PageType.CONTACT: 50,
-    PageType.HOME: 45,
+    PageType.ABOUT: 80,
+    PageType.HOME: 75,
+    PageType.CONTACT: 70,
+    PageType.FAQ: 65,
     PageType.BLOG: 35,
-    PageType.OTHER: 25,
-    PageType.POLICY: 15,
-    PageType.UNKNOWN: 10,
+    PageType.OTHER: 30,
+    PageType.POLICY: 25,
+    PageType.UNKNOWN: 15,
 }
 
 SECTION_PRIORITY_BONUS: dict[str, int] = {
@@ -157,8 +176,73 @@ class WebsitePipelineResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Deterministic Fallback Implementation
+# Category Classification & Relevance Helpers
 # ---------------------------------------------------------------------------
+
+def categorize_candidate(candidate: CandidateURL, base_url: str = "") -> SelectionCategory:
+    """Classify a candidate URL into one of six balanced selection categories.
+
+    Uses PageType classification, URL path tokens, and anchor text clues.
+    """
+    norm_url = candidate.url.lower().rstrip("/")
+    clean_base = base_url.lower().rstrip("/") if base_url else ""
+    parsed = urllib.parse.urlsplit(norm_url)
+    path = parsed.path.strip("/").lower()
+    text = (candidate.link_text or "").lower()
+
+    # 1. Homepage
+    if (
+        candidate.page_type == PageType.HOME
+        or (clean_base and norm_url == clean_base)
+        or path in ("", "index.html", "index.php", "home")
+        or text in ("home", "homepage", "main")
+    ):
+        return SelectionCategory.HOME
+
+    # 2. About / Company
+    if candidate.page_type == PageType.ABOUT:
+        return SelectionCategory.ABOUT
+    about_tokens = ("about", "who-we-are", "our-story", "our-team", "company", "mission", "leadership")
+    if any(t in path for t in about_tokens) or any(t in text for t in ("about", "who we are", "our story", "our team", "leadership", "company", "mission")):
+        return SelectionCategory.ABOUT
+
+    # 3. Pricing & Offers
+    if candidate.page_type in (PageType.PRICING, PageType.OFFER):
+        return SelectionCategory.PRICING_OFFER
+    pricing_tokens = (
+        "pricing", "prices", "price", "plans", "packages", "rates",
+        "subscription", "subscriptions", "fees", "cost", "tier", "tiers",
+        "offer", "offers", "deals", "deal", "discount", "discounts",
+        "promo", "promotions", "sale", "clearance", "coupons",
+    )
+    path_tokens = set(re.split(r"[-_/]", path))
+    if any(t in path_tokens for t in pricing_tokens) or any(t in text for t in ("pricing", "plans", "rates", "subscription", "packages", "deals", "offers", "sale", "discount")):
+        return SelectionCategory.PRICING_OFFER
+
+    # 4. Contact & Booking
+    if candidate.page_type == PageType.CONTACT:
+        return SelectionCategory.CONTACT_BOOKING
+    contact_tokens = (
+        "contact", "book", "booking", "appointment", "schedule", "quote",
+        "demo", "request-demo", "locations", "location", "reach", "offices",
+    )
+    if any(t in path_tokens for t in contact_tokens) or any(t in text for t in ("contact", "get in touch", "book", "booking", "appointment", "schedule", "quote", "demo", "request demo")):
+        return SelectionCategory.CONTACT_BOOKING
+
+    # 5. Products / Services
+    if candidate.page_type in (PageType.PRODUCT, PageType.SERVICE):
+        return SelectionCategory.PRODUCT_SERVICE
+    product_service_tokens = (
+        "product", "products", "shop", "store", "collection", "collections",
+        "catalog", "catalogue", "merchandise", "items", "goods", "features", "feature", "platform",
+        "service", "services", "solution", "solutions", "offerings", "capabilities",
+        "treatments", "consulting", "use-case", "use-cases", "case-study", "case-studies",
+    )
+    if any(t in path_tokens for t in product_service_tokens) or any(t in text for t in ("product", "products", "shop", "collection", "service", "services", "solutions", "features")):
+        return SelectionCategory.PRODUCT_SERVICE
+
+    # 6. Other Relevant (FAQ, Policies, Blog, Reviews)
+    return SelectionCategory.OTHER_RELEVANT
 
 
 def calculate_product_relevance(
@@ -201,6 +285,26 @@ def calculate_product_relevance(
 
     return score
 
+
+def _get_path_stem(url: str) -> str:
+    """Extract a normalized path stem without trailing query params or variant tokens."""
+    parsed = urllib.parse.urlsplit(url.lower().rstrip("/"))
+    path = parsed.path
+    # Strip common product variant suffixes (e.g. -shade-01, -01, etc.)
+    stem = re.sub(r"[-_](?:shade|color|colour|size|variant|v)?[0-9]+$", "", path)
+    return stem
+
+
+def _count_stem_occurrences(url: str, selected_urls: set[str]) -> int:
+    """Count how many already selected URLs share the same normalized path stem."""
+    stem = _get_path_stem(url)
+    return sum(1 for sel in selected_urls if _get_path_stem(sel) == stem)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Balanced Page Selection Implementation
+# ---------------------------------------------------------------------------
+
 def select_pages_deterministic(
     candidates: list[CandidateURL],
     *,
@@ -208,20 +312,28 @@ def select_pages_deterministic(
     base_url: str = "",
     product_or_service: str | None = None,
 ) -> PageSelectionResult:
-    """Deterministically select up to `max_pages` candidate URLs based on business priorities.
+    """Deterministically select a balanced, representative set of up to `max_pages` candidate URLs.
 
-    Selection rules:
-    - Include the homepage if present among candidates or matching base_url.
-    - Score and rank remaining candidates based on PageType priority (Pricing > Product/Service >
-      Offers > About > FAQ > Contact > Blog > Policy).
-    - Favor navigation and header links over footer and general sitemap links.
-    - Deduplicate normalized URLs.
-    - Never invent URLs; every selected page originates from `candidates`.
+    Balanced selection strategy:
+    - Normalizes and deduplicates discovered candidates.
+    - Groups candidates into 6 core business dimensions:
+      1. Homepage (identity, baseline positioning)
+      2. About / Company (background, credentials)
+      3. Products / Services (features, offerings, prioritizing target product if specified)
+      4. Pricing / Offers (pricing plans, rates, promotional offers)
+      5. Contact / Booking (conversion, service access)
+      6. Supporting context (FAQs, key policies, case studies)
+    - Allocates slots across available categories so that no single category (such as
+      many similar product variants) crowds out essential business context.
+    - If a category is absent on the website, its slot automatically flows to the next
+      most informative available pages.
+    - Never invents URLs; every selected page originates from `candidates`.
 
     Args:
         candidates: Discovered candidate URLs.
         max_pages: Maximum number of pages to select.
         base_url: Website base URL to identify the homepage.
+        product_or_service: Target product or service from user business intake.
 
     Returns:
         A populated :class:`PageSelectionResult` instance.
@@ -243,95 +355,198 @@ def select_pages_deterministic(
             seen_normalized.add(norm_key)
             unique_candidates.append(c)
 
-    # 2. Identify and prioritize the homepage and primary about page
-    clean_base = base_url.lower().rstrip("/") if base_url else ""
-    homepage_candidate: CandidateURL | None = None
-    about_candidate: CandidateURL | None = None
-    other_candidates: list[CandidateURL] = []
-
-    for c in unique_candidates:
-        norm_url = c.url.lower().rstrip("/")
-        parsed = urllib.parse.urlsplit(norm_url)
-        path = parsed.path.strip("/")
-
-        is_home = (
-            c.page_type == PageType.HOME
-            or (clean_base and norm_url == clean_base)
-            or path in ("", "index.html", "index.php", "home")
-        )
-
-        if is_home and homepage_candidate is None:
-            homepage_candidate = c
-        elif c.page_type == PageType.ABOUT and about_candidate is None:
-            about_candidate = c
-        else:
-            other_candidates.append(c)
-
-    # 3. Score other candidates taking product relevance into account
+    # 2. Extract product relevance parameters
     keywords = extract_product_keywords(product_or_service) if product_or_service else []
     product_phrase = product_or_service.strip() if product_or_service else ""
-    has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in other_candidates)
+    has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in unique_candidates)
 
-    def _calculate_score(candidate: CandidateURL) -> tuple[int, int, str]:
-        type_score = PAGE_TYPE_PRIORITY.get(candidate.page_type, 10)
-        section_score = SECTION_PRIORITY_BONUS.get(candidate.source_section, 0)
-        relevance = calculate_product_relevance(candidate, keywords, product_phrase) if keywords else 0
+    # 3. Categorize all unique candidates
+    buckets: dict[SelectionCategory, list[CandidateURL]] = {cat: [] for cat in SelectionCategory}
+    for c in unique_candidates:
+        cat = categorize_candidate(c, base_url=base_url)
+        buckets[cat].append(c)
+
+    # 4. Helper to score and rank candidates within their category
+    def _rank_candidate(c: CandidateURL) -> tuple[int, int, str]:
+        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
+        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
+        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
         total_score = type_score + section_score + relevance
 
+        # Collection / category boost
+        norm_url = c.url.lower()
+        if any(seg in norm_url for seg in ("/collection", "/collections", "/category", "/categories")):
+            total_score += 40
+
+        # Sub-type bonuses within category
+        if c.page_type == PageType.FAQ:
+            total_score += 10
+        elif c.page_type == PageType.POLICY:
+            if any(term in norm_url for term in ("shipping", "refund", "return", "delivery")):
+                total_score += 10
+            elif any(term in norm_url for term in ("privacy", "terms", "cookie")):
+                total_score -= 15
+
         # When matching product pages exist, penalize unrelated product pages
-        if has_matches and relevance == 0 and candidate.page_type == PageType.PRODUCT:
+        if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
             total_score -= 60
 
-        # Shorter paths generally represent higher-level category pages
-        path_segments = len([s for s in urllib.parse.urlsplit(candidate.url).path.split("/") if s])
-        return (total_score, -path_segments, candidate.url)
+        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
+        return (total_score, -path_segments, c.url)
 
-    sorted_candidates = sorted(other_candidates, key=_calculate_score, reverse=True)
+    # Sort each category bucket by ranking score
+    for cat in buckets:
+        buckets[cat].sort(key=_rank_candidate, reverse=True)
 
-    # 4. Assemble selection up to max_pages
+    # 5. Execute Multi-Stage Priority Budgeting
     selected_pages: list[SelectedPage] = []
+    selected_urls: set[str] = set()
 
-    if homepage_candidate is not None:
+    def _add_page(candidate: CandidateURL, reason: str) -> bool:
+        if len(selected_pages) >= max_pages:
+            return False
+        norm_key = candidate.url.lower().rstrip("/")
+        if norm_key in selected_urls:
+            return False
+        selected_urls.add(norm_key)
         selected_pages.append(
             SelectedPage(
-                url=homepage_candidate.url,
-                page_type=homepage_candidate.page_type or PageType.HOME,
-                link_text=homepage_candidate.link_text,
-                source_section=homepage_candidate.source_section,
-                selection_reason="Homepage provides baseline brand identity, positioning, and overall navigation context.",
-            )
-        )
-
-    if about_candidate is not None and len(selected_pages) < max_pages:
-        selected_pages.append(
-            SelectedPage(
-                url=about_candidate.url,
-                page_type=about_candidate.page_type or PageType.ABOUT,
-                link_text=about_candidate.link_text,
-                source_section=about_candidate.source_section,
-                selection_reason="About page provides foundational brand background, company story, and positioning context.",
-            )
-        )
-
-    remaining_slots = max(0, max_pages - len(selected_pages))
-    for c in sorted_candidates[:remaining_slots]:
-        type_name = c.page_type.value if hasattr(c.page_type, "value") else str(c.page_type)
-        rel = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
-        if rel > 0:
-            reason = f"Selected for target product relevance ({product_phrase}) from {c.source_section}."
-        elif product_phrase and not has_matches:
-            reason = f"Priority {type_name} page selected via deterministic hierarchy (no matching pages for '{product_phrase}' found)."
-        else:
-            reason = f"Priority {type_name} page selected via deterministic hierarchy from {c.source_section}."
-        selected_pages.append(
-            SelectedPage(
-                url=c.url,
-                page_type=c.page_type,
-                link_text=c.link_text,
-                source_section=c.source_section,
+                url=candidate.url,
+                page_type=candidate.page_type,
+                link_text=candidate.link_text,
+                source_section=candidate.source_section,
                 selection_reason=reason,
             )
         )
+        return True
+
+    # --- Phase 1: Homepage (Identity & baseline positioning) ---
+    if buckets[SelectionCategory.HOME] and len(selected_pages) < max_pages:
+        home_c = buckets[SelectionCategory.HOME][0]
+        _add_page(
+            home_c,
+            "Homepage provides baseline brand identity, positioning, and overall navigation context.",
+        )
+
+    # --- Phase 2: About / Company Story (Foundational background & credibility) ---
+    if buckets[SelectionCategory.ABOUT] and len(selected_pages) < max_pages:
+        about_c = buckets[SelectionCategory.ABOUT][0]
+        _add_page(
+            about_c,
+            "About page provides foundational brand background, company story, and positioning context.",
+        )
+
+    # --- Phase 3: Target Product / Service Offerings ---
+    # When target product/service matches exist, prioritize matching collection + product pages.
+    # Otherwise select top general product/service offerings.
+    prod_candidates = buckets[SelectionCategory.PRODUCT_SERVICE]
+    if prod_candidates and len(selected_pages) < max_pages:
+        # Determine quota for product/service in this first pass (leave room for pricing/contact/etc.)
+        if has_matches:
+            # Allocate up to min(3, remaining slots) for relevant products
+            prod_quota = min(3, max_pages - len(selected_pages))
+            matching_prod = [c for c in prod_candidates if calculate_product_relevance(c, keywords, product_phrase) > 0]
+            unrelated_prod = [c for c in prod_candidates if calculate_product_relevance(c, keywords, product_phrase) == 0]
+            prod_queue = matching_prod + unrelated_prod
+        else:
+            prod_quota = min(2, max_pages - len(selected_pages))
+            prod_queue = prod_candidates
+
+        added_prod = 0
+        # Check if diverse product stems exist
+        prod_stems = {_get_path_stem(c.url) for c in prod_queue}
+        has_diverse_stems = len(prod_stems) > 1
+
+        for pc in prod_queue:
+            if added_prod >= prod_quota or len(selected_pages) >= max_pages:
+                break
+            # If diverse stems exist, don't pick multiple variants of the same item in first pass
+            stem_count = _count_stem_occurrences(pc.url, selected_urls)
+            if has_diverse_stems and stem_count >= 1:
+                continue
+
+            rel = calculate_product_relevance(pc, keywords, product_phrase) if keywords else 0
+            type_name = pc.page_type.value if hasattr(pc.page_type, "value") else str(pc.page_type)
+            if rel > 0:
+                reason = f"Selected for target product relevance ({product_phrase}) from {pc.source_section}."
+            elif product_phrase and not has_matches:
+                reason = f"Priority {type_name} page selected via deterministic hierarchy (no matching pages for '{product_phrase}' found)."
+            else:
+                reason = f"Priority {type_name} page selected via deterministic hierarchy from {pc.source_section}."
+
+            if _add_page(pc, reason):
+                added_prod += 1
+
+    # --- Phase 4: Pricing & Offers ---
+    pricing_candidates = buckets[SelectionCategory.PRICING_OFFER]
+    if pricing_candidates and len(selected_pages) < max_pages:
+        # Select up to 2 pricing/offer pages (e.g. 1 pricing + 1 promotion/offer)
+        for pr_c in pricing_candidates[:2]:
+            if len(selected_pages) >= max_pages:
+                break
+            type_name = pr_c.page_type.value if hasattr(pr_c.page_type, "value") else str(pr_c.page_type)
+            if pr_c.page_type == PageType.PRICING:
+                reason = f"Commercial pricing page providing pricing structure and subscription/rate details from {pr_c.source_section}."
+            else:
+                reason = f"Promotional offers/deals page providing commercial discount and incentive intelligence from {pr_c.source_section}."
+            _add_page(pr_c, reason)
+
+    # --- Phase 5: Contact / Booking ---
+    contact_candidates = buckets[SelectionCategory.CONTACT_BOOKING]
+    if contact_candidates and len(selected_pages) < max_pages:
+        con_c = contact_candidates[0]
+        _add_page(
+            con_c,
+            f"Contact and service access page providing booking, appointment, or customer inquiry pathways from {con_c.source_section}.",
+        )
+
+    # --- Phase 6: Supporting Information (FAQ, Shipping/Returns, Case Studies) ---
+    other_candidates = buckets[SelectionCategory.OTHER_RELEVANT]
+    if other_candidates and len(selected_pages) < max_pages:
+        for oth_c in other_candidates:
+            if len(selected_pages) >= max_pages:
+                break
+            type_name = oth_c.page_type.value if hasattr(oth_c.page_type, "value") else str(oth_c.page_type)
+            if oth_c.page_type == PageType.FAQ:
+                reason = f"FAQ support page providing customer questions, terms, and service answers from {oth_c.source_section}."
+            elif oth_c.page_type == PageType.POLICY:
+                reason = f"Customer policy page (shipping/returns/terms) providing fulfillment terms from {oth_c.source_section}."
+            else:
+                reason = f"Supporting context page ({type_name}) providing business intelligence from {oth_c.source_section}."
+            if _add_page(oth_c, reason):
+                break
+
+    # --- Phase 7: Fill Remaining Slots with Best Available Candidates ---
+    # If any slots remain (e.g. site has no pricing page, no contact page, or has more capacity),
+    # backfill with the highest-scoring remaining candidates across all categories.
+    if len(selected_pages) < max_pages:
+        remaining_candidates = [
+            c for c in unique_candidates
+            if c.url.lower().rstrip("/") not in selected_urls
+        ]
+        # Sort remaining by rank
+        remaining_candidates.sort(key=_rank_candidate, reverse=True)
+
+        # First try candidates with fresh stems that have not been selected yet
+        fresh_stem_candidates = [c for c in remaining_candidates if _count_stem_occurrences(c.url, selected_urls) == 0]
+        duplicate_stem_candidates = [c for c in remaining_candidates if _count_stem_occurrences(c.url, selected_urls) > 0]
+        # Prioritize fresh stems, but allow duplicate stems if slots still remain
+        ordered_backfill = fresh_stem_candidates + duplicate_stem_candidates
+
+        for rem_c in ordered_backfill:
+            if len(selected_pages) >= max_pages:
+                break
+
+            rel = calculate_product_relevance(rem_c, keywords, product_phrase) if keywords else 0
+            type_name = rem_c.page_type.value if hasattr(rem_c.page_type, "value") else str(rem_c.page_type)
+            if rel > 0:
+                reason = f"Selected for target product relevance ({product_phrase}) from {rem_c.source_section}."
+            elif product_phrase and not has_matches:
+                reason = f"Priority {type_name} page selected via deterministic hierarchy (no matching pages for '{product_phrase}' found)."
+            else:
+                reason = f"Priority {type_name} page selected via deterministic hierarchy from {rem_c.source_section}."
+
+            _add_page(rem_c, reason)
 
     count = len(selected_pages)
     logger.info("Deterministic selection selected %d page(s) (cap: %d).", count, max_pages)
@@ -349,6 +564,77 @@ def select_pages_deterministic(
 # LLM-Based Page Selection Implementation
 # ---------------------------------------------------------------------------
 
+def _select_balanced_candidates_for_prompt(
+    candidates: list[CandidateURL],
+    website_url: str,
+    product_or_service: str | None = None,
+    max_prompt_candidates: int = MAX_PROMPT_CANDIDATES,
+) -> list[CandidateURL]:
+    """Assemble a balanced, representative candidate list for the LLM prompt.
+
+    Ensures that high-volume categories (such as dozens of product variants)
+    do not crowd out essential categories (Homepage, About, Pricing, Contact, FAQs)
+    from the candidate list sent to OpenAI.
+    """
+    if len(candidates) <= max_prompt_candidates:
+        return candidates
+
+    clean_base = website_url.lower().rstrip("/") if website_url else ""
+    keywords = extract_product_keywords(product_or_service) if product_or_service else []
+    product_phrase = product_or_service.strip() if product_or_service else ""
+
+    # Group by selection category
+    buckets: dict[SelectionCategory, list[CandidateURL]] = {cat: [] for cat in SelectionCategory}
+    for c in candidates:
+        cat = categorize_candidate(c, base_url=clean_base)
+        buckets[cat].append(c)
+
+    def _sort_key(c: CandidateURL) -> tuple[int, int, str]:
+        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
+        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
+        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
+        total_score = type_score + section_score + relevance
+        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
+        return (total_score, -path_segments, c.url)
+
+    for cat in buckets:
+        buckets[cat].sort(key=_sort_key, reverse=True)
+
+    selected_prompt_candidates: list[CandidateURL] = []
+    seen: set[str] = set()
+
+    def _add(c: CandidateURL) -> None:
+        key = c.url.lower().rstrip("/")
+        if key not in seen and len(selected_prompt_candidates) < max_prompt_candidates:
+            seen.add(key)
+            selected_prompt_candidates.append(c)
+
+    # 1. Guaranteed Core Categories (if available)
+    for c in buckets[SelectionCategory.HOME][:2]:
+        _add(c)
+    for c in buckets[SelectionCategory.ABOUT][:4]:
+        _add(c)
+    for c in buckets[SelectionCategory.PRICING_OFFER][:6]:
+        _add(c)
+    for c in buckets[SelectionCategory.CONTACT_BOOKING][:4]:
+        _add(c)
+    for c in buckets[SelectionCategory.OTHER_RELEVANT][:6]:
+        _add(c)
+
+    # 2. Product / Service Offerings (prioritizing target product)
+    for c in buckets[SelectionCategory.PRODUCT_SERVICE][:25]:
+        _add(c)
+
+    # 3. Fill Remaining Prompt Budget from Highest-Scoring Candidates
+    remaining = [c for c in candidates if c.url.lower().rstrip("/") not in seen]
+    remaining.sort(key=_sort_key, reverse=True)
+    for c in remaining:
+        _add(c)
+        if len(selected_prompt_candidates) >= max_prompt_candidates:
+            break
+
+    return selected_prompt_candidates
+
 
 async def select_pages_with_llm(
     candidates: list[CandidateURL],
@@ -358,18 +644,22 @@ async def select_pages_with_llm(
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     model: str | None = None,
 ) -> PageSelectionResult:
-    """Select up to `max_pages` relevant candidate URLs using structured OpenAI completion.
+    """Select a balanced set of up to `max_pages` relevant candidate URLs using structured OpenAI completion.
 
     Validates that:
-    - Every selected URL exists in the input candidate list.
-    - Duplicates are pruned.
+    - Every selected URL exists in the input candidate list (rejects hallucinated URLs).
+    - Duplicates and near-duplicate variants are pruned.
     - Selections do not exceed `max_pages`.
+    - Baseline context (Homepage, About) is preserved if available among candidates.
+    - If the LLM returns fewer than `max_pages` pages, remaining slots are backfilled
+      using balanced deterministic candidates.
     - If the LLM response is malformed, unavailable, or the API call fails,
       transparently falls back to :func:`select_pages_deterministic`.
 
     Args:
         candidates: Combined candidate URLs from URL discovery.
         website_url: Target business website URL.
+        product_or_service: Optional primary product or service focus.
         max_pages: Maximum number of pages to select.
         model: Optional LLM model identifier. Defaults to shared configuration (settings.LLM_MODEL).
 
@@ -405,25 +695,13 @@ async def select_pages_with_llm(
     candidate_map: dict[str, CandidateURL] = {c.url: c for c in candidates}
     norm_candidate_map: dict[str, CandidateURL] = {c.url.lower().rstrip("/"): c for c in candidates}
 
-    # 3. Format candidate URLs for the prompt (cap at MAX_PROMPT_CANDIDATES to keep context focused)
-    keywords = extract_product_keywords(product_or_service) if product_or_service else []
-    product_phrase = product_or_service.strip() if product_or_service else ""
-    has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in candidates)
-
-    def _prompt_candidate_sort_key(c: CandidateURL) -> tuple[int, int, str]:
-        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 10)
-        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
-        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
-        total_score = type_score + section_score + relevance
-
-        # When matching product pages exist, deprioritize unrelated product pages
-        if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
-            total_score -= 60
-
-        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
-        return (total_score, -path_segments, c.url)
-
-    sorted_for_prompt = sorted(candidates, key=_prompt_candidate_sort_key, reverse=True)[:MAX_PROMPT_CANDIDATES]
+    # 3. Assemble balanced candidate URLs for prompt
+    sorted_for_prompt = _select_balanced_candidates_for_prompt(
+        candidates,
+        website_url=website_url,
+        product_or_service=product_or_service,
+        max_prompt_candidates=MAX_PROMPT_CANDIDATES,
+    )
 
     formatted_lines: list[str] = []
     for c in sorted_for_prompt:
@@ -431,6 +709,7 @@ async def select_pages_with_llm(
         type_str = c.page_type.value if hasattr(c.page_type, "value") else str(c.page_type)
         formatted_lines.append(f"- URL: {c.url} | Category: {type_str} | Found in: {c.source_section}{text_snippet}")
 
+    product_phrase = product_or_service.strip() if product_or_service else ""
     product_context = f"Target Product / Service: {product_phrase}\n" if product_phrase else ""
     system_prompt = PAGE_SELECTION_SYSTEM_PROMPT.format(max_pages=max_pages, homepage_url=website_url)
     user_prompt = PAGE_SELECTION_USER_PROMPT_TEMPLATE.format(
@@ -507,6 +786,62 @@ async def select_pages_with_llm(
             res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
             res.error_message = "All LLM-selected URLs failed candidate membership validation."
             return res
+
+        # 6. Post-LLM Balancing & Slot Backfilling
+        # Check if homepage candidate existed but was omitted by LLM
+        clean_base = website_url.lower().rstrip("/") if website_url else ""
+        home_candidate: CandidateURL | None = None
+        for c in candidates:
+            if categorize_candidate(c, base_url=clean_base) == SelectionCategory.HOME:
+                home_candidate = c
+                break
+
+        if home_candidate is not None:
+            home_norm = home_candidate.url.lower().rstrip("/")
+            if home_norm not in seen_urls:
+                if len(validated_pages) < max_pages:
+                    # Prepend homepage to anchor brand positioning
+                    validated_pages.insert(
+                        0,
+                        SelectedPage(
+                            url=home_candidate.url,
+                            page_type=home_candidate.page_type,
+                            link_text=home_candidate.link_text,
+                            source_section=home_candidate.source_section,
+                            selection_reason="Homepage provides baseline brand identity, positioning, and overall navigation context.",
+                        ),
+                    )
+                    seen_urls.add(home_norm)
+                else:
+                    # Replace lowest priority / redundant page with homepage
+                    validated_pages.pop()
+                    validated_pages.insert(
+                        0,
+                        SelectedPage(
+                            url=home_candidate.url,
+                            page_type=home_candidate.page_type,
+                            link_text=home_candidate.link_text,
+                            source_section=home_candidate.source_section,
+                            selection_reason="Homepage provides baseline brand identity, positioning, and overall navigation context.",
+                        ),
+                    )
+                    seen_urls.add(home_norm)
+
+        # Backfill if LLM returned fewer than max_pages and candidates exist
+        if len(validated_pages) < max_pages and len(candidates) > len(validated_pages):
+            fallback_res = select_pages_deterministic(
+                candidates,
+                max_pages=max_pages,
+                base_url=website_url,
+                product_or_service=product_or_service,
+            )
+            for fb_page in fallback_res.selected_pages:
+                if len(validated_pages) >= max_pages:
+                    break
+                fb_norm = fb_page.url.lower().rstrip("/")
+                if fb_norm not in seen_urls:
+                    seen_urls.add(fb_norm)
+                    validated_pages.append(fb_page)
 
         logger.info(
             "OpenAI page selection successfully selected %d page(s) for %s.",

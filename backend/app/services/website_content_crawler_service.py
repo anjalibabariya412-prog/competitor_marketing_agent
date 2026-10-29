@@ -55,10 +55,10 @@ logger = logging.getLogger(__name__)
 WEBSITE_CONTENT_CRAWLER_ACTOR_ID: str = "apify/website-content-crawler"
 
 # Default maximum number of pages to scrape per crawl run
-DEFAULT_MAX_PAGES: int = 8
+DEFAULT_MAX_PAGES: int = 10
 
 # Maximum runtime allowed for the Apify Actor run
-DEFAULT_ACTOR_TIMEOUT_SECONDS: int = 180
+DEFAULT_ACTOR_TIMEOUT_SECONDS: int = getattr(settings, "CRAWLER_ACTOR_TIMEOUT_SECONDS", 240)
 
 # Retries for transient network/platform errors
 MAX_TRANSIENT_RETRIES: int = 2
@@ -71,7 +71,8 @@ MAX_PAGE_CONTENT_CHARS: int = 100_000
 
 # CSS selectors for DOM elements removed by the actor prior to content conversion
 NOISE_REMOVAL_CSS_SELECTOR: str = (
-    "nav, header, footer, script, style, noscript, svg, aside, form, "
+    "nav, header, footer, script, style, noscript, svg, aside, "
+    "form[role='search'], form.search, form#search, form.newsletter, form#newsletter, "
     "[role='navigation'], [role='banner'], [role='contentinfo'], "
     ".cookie-banner, #cookie-notice, .ad-banner, .advertisement, "
     ".nav-menu, #menu, .sidebar, .share-buttons"
@@ -93,27 +94,50 @@ DISALLOWED_SOCIAL_DOMAINS: tuple[str, ...] = (
     "whatsapp.com",
 )
 
-# Block signals indicating bot detection, CAPTCHA, or WAF challenges
-BLOCK_SIGNALS: tuple[str, ...] = (
+# Definitive challenge signatures that indicate an active challenge/block regardless of length
+DEFINITIVE_BLOCK_SIGNALS: tuple[str, ...] = (
+    "please verify you are a human",
+    "verify you are human",
+    "verify that you are human",
+    "cf-challenge",
+    "checking your browser before accessing",
+    "attention required! | cloudflare",
+    "you have been blocked",
+    "why have i been blocked",
+    "security check to continue",
+    "complete the security check to continue",
+    "ddos-guard protection",
+)
+
+# Ambiguous signals that indicate a block ONLY when page content is short / challenge-dominated
+AMBIGUOUS_BLOCK_SIGNALS: tuple[str, ...] = (
     "captcha",
     "g-recaptcha",
     "hcaptcha",
-    "cf-challenge",
     "cloudflare ray id",
+    "ray id:",
     "access denied",
     "403 forbidden",
     "451 unavailable",
-    "you have been blocked",
     "bot detected",
-    "please verify you are a human",
     "ddos-guard",
-    "security check to continue",
 )
 
-# Regex patterns for removing cookie consent and repetitive noise
+# Backward-compatible alias combining both sets
+BLOCK_SIGNALS: tuple[str, ...] = DEFINITIVE_BLOCK_SIGNALS + AMBIGUOUS_BLOCK_SIGNALS
+
+# Threshold: genuine challenge pages are concise stub pages (< 1500 chars)
+MAX_CHALLENGE_PAGE_CHARS: int = 1500
+
+# Targeted regex for cookie banners: bounded length, requiring consent action
 _COOKIE_BANNER_REGEX = re.compile(
-    r"(?i)(?:we use cookies|this website uses cookies|cookie preferences|accept all cookies|privacy choices).*?(?:accept|agree|decline|manage|close)\b",
-    re.DOTALL,
+    r"(?i)(?:^|\n)[^\n]*?(?:we use cookies|this (?:website|site) uses cookies|our website uses cookies|cookies help us (?:deliver|improve)|by continuing to (?:browse|use)|cookie preferences|cookie policy|notice about cookies|we value your privacy)[^\n]*?(?:\n[^\n]*?){0,4}?(?:accept all(?: cookies)?|accept and continue|allow (?:all )?cookies|agree to (?:all )?cookies|manage (?:cookie )?preferences|reject all(?: cookies)?|decline cookies|got it|i accept|i agree|save preferences)[^\n]*?(?=\n|$)",
+)
+
+# Indicators of price or commercial offers to protect during paragraph deduplication
+_PRICE_INDICATOR_REGEX = re.compile(
+    r"(?:₹|\$|€|£|rs\.?|inr|usd|\bprice\b|\bdiscount\b|\bcoupon\b|\boff\b|\bfree\b|\b\d+(?:\.\d{2})?\s*(?:/mo|/yr|per month)\b)",
+    re.IGNORECASE,
 )
 
 _MULTIPLE_NEWLINES_REGEX = re.compile(r"\n{3,}")
@@ -178,6 +202,10 @@ class WebsiteCrawlResult(BaseModel):
         default=None,
         description="Apify Actor run ID for debugging, or None if no run was executed.",
     )
+    actor_status: str | None = Field(
+        default=None,
+        description="Raw Apify Actor execution status (e.g. SUCCEEDED, TIMED-OUT, FAILED, ABORTED).",
+    )
     execution_time_seconds: float = Field(
         default=0.0,
         description="Total wall-clock duration in seconds.",
@@ -230,6 +258,142 @@ def _normalize_target_url(url: str) -> str | None:
         return None
 
 
+def _clean_html_fragment(soup: BeautifulSoup) -> None:
+    """Clean unwanted elements while preserving content-rich forms (products, bookings)."""
+    for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "svg", "aside"]):
+        tag.decompose()
+
+    for form in soup.find_all("form"):
+        role = (form.get("role") or "").lower()
+        classes = " ".join(form.get("class") or []).lower()
+        form_id = (form.get("id") or "").lower()
+        is_noise = (
+            role == "search"
+            or "search" in classes
+            or "search" in form_id
+            or "newsletter" in classes
+            or "newsletter" in form_id
+            or "subscribe" in classes
+            or "subscribe" in form_id
+        )
+        if is_noise:
+            form.decompose()
+        else:
+            for inp in form.find_all("input"):
+                if (inp.get("type") or "").lower() in ("hidden", "password", "submit", "button", "reset"):
+                    inp.decompose()
+            form.unwrap()
+
+
+def _extract_text_from_html(html_str: str) -> str:
+    """Extract clean readable text from HTML markup, discarding scripts/styles/noise."""
+    if not html_str or not html_str.strip():
+        return ""
+    try:
+        soup = BeautifulSoup(html_str, "html.parser")
+        _clean_html_fragment(soup)
+        return soup.get_text(separator="\n")
+    except Exception:
+        return ""
+
+
+def _extract_best_content(item: dict[str, Any]) -> str:
+    """Select the highest quality content representation from crawler dataset item.
+
+    Prefers clean Markdown if it contains sufficient content (>= MIN_PAGE_CONTENT_CHARS).
+    If Markdown is empty or sparse, falls back to text, content, or cleaned HTML.
+    Never concatenates representations to prevent duplication.
+    """
+    markdown = (item.get("markdown") or "").strip()
+    text = (item.get("text") or "").strip()
+    content = (item.get("content") or "").strip()
+    html = item.get("html") or ""
+
+    # 1. Preferred representation: markdown with sufficient length
+    if len(markdown) >= MIN_PAGE_CONTENT_CHARS:
+        return markdown
+
+    # 2. Candidate from direct text or content fields
+    candidate = markdown or text or content
+
+    # 3. If candidate is too short (< MIN_PAGE_CONTENT_CHARS), check if HTML provides fuller content
+    if html:
+        html_text = _extract_text_from_html(html).strip()
+        if len(html_text) >= MIN_PAGE_CONTENT_CHARS and len(html_text) > len(candidate):
+            return html_text
+
+    # 4. Fallback to candidate if present, else whatever HTML text was recovered
+    if candidate:
+        return candidate
+    if html:
+        return _extract_text_from_html(html).strip()
+
+    return ""
+
+
+def _is_blocked_content(text: str) -> bool:
+    """Determine whether page text signals an active CAPTCHA, WAF, or access block.
+
+    Avoids false positives on substantive pages that merely discuss security,
+    include reCAPTCHA badges in footers, or specify access restrictions in terms.
+    """
+    if not text:
+        return False
+    lower = text.lower()
+
+    # 1. Definitive challenge signatures are active blocks regardless of length
+    if any(sig in lower for sig in DEFINITIVE_BLOCK_SIGNALS):
+        return True
+
+    # 2. Ambiguous signals only count if the page is short (< MAX_CHALLENGE_PAGE_CHARS)
+    if len(text.strip()) < MAX_CHALLENGE_PAGE_CHARS:
+        return any(sig in lower for sig in AMBIGUOUS_BLOCK_SIGNALS)
+
+    return False
+
+
+def _deduplicate_paragraphs_conservatively(text: str) -> str:
+    """Conservatively remove exact duplicate boilerplate paragraphs within a single page.
+
+    Preserves:
+    - Short headings, labels, and standalone price/status lines (< 40 chars).
+    - Product descriptions, variants, and service outlines.
+    - Repeated price lines associated with distinct products.
+
+    Removes:
+    - Exact repeated boilerplate paragraphs (>= 40 chars) occurring multiple times on the same page.
+    """
+    if not text:
+        return ""
+    paragraphs = text.split("\n\n")
+    if len(paragraphs) <= 1:
+        return text
+
+    seen_paragraphs: set[str] = set()
+    cleaned_paragraphs: list[str] = []
+
+    for p in paragraphs:
+        stripped = p.strip()
+        if not stripped:
+            continue
+
+        # Short lines (< 40 chars) like headings ('Features') or standalone price tags
+        # ('Price: $25.00') must never be deduplicated so product associations survive.
+        if len(stripped) < 40:
+            cleaned_paragraphs.append(stripped)
+            continue
+
+        # Substantive boilerplate (>= 40 chars): deduplicate exact identical matches
+        normalized_key = re.sub(r"\s+", " ", stripped.lower())
+        if normalized_key in seen_paragraphs:
+            continue
+
+        seen_paragraphs.add(normalized_key)
+        cleaned_paragraphs.append(stripped)
+
+    return "\n\n".join(cleaned_paragraphs)
+
+
 def _clean_page_content(raw_text: str) -> tuple[str, bool, bool]:
     """Clean extracted page text/markdown to remove boilerplate and noise.
 
@@ -241,30 +405,30 @@ def _clean_page_content(raw_text: str) -> tuple[str, bool, bool]:
 
     text = raw_text.strip()
 
-    # 1. Check for blocking / bot detection patterns
-    lower_snippet = text[:2000].lower()
-    is_blocked = any(signal in lower_snippet for signal in BLOCK_SIGNALS)
-    if is_blocked:
+    # 1. Check for blocking / bot detection patterns (with false-positive protection)
+    if _is_blocked_content(text):
         return "", True, False
 
-    # 2. Strip leftover HTML tags if present in markdown/text
-    if "<html" in text.lower() or "<body" in text.lower() or "<div" in text.lower():
+    # 2. Strip leftover HTML tags if present in markdown/text while preserving content-rich forms
+    if "<html" in text.lower() or "<body" in text.lower() or "<div" in text.lower() or "<form" in text.lower():
         try:
             soup = BeautifulSoup(text, "html.parser")
-            for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "svg", "form"]):
-                tag.decompose()
+            _clean_html_fragment(soup)
             text = soup.get_text(separator="\n")
         except Exception:
             pass
 
-    # 3. Strip cookie banner boilerplate
+    # 3. Strip cookie banner boilerplate safely without deleting surrounding text
     text = _COOKIE_BANNER_REGEX.sub("", text)
 
-    # 4. Normalize multiple spaces and excess blank lines
+    # 4. Normalize multiple spaces and blank lines
     text = _MULTIPLE_SPACES_REGEX.sub(" ", text)
     text = _MULTIPLE_NEWLINES_REGEX.sub("\n\n", text).strip()
 
-    # 5. Check length limits
+    # 5. Apply conservative duplicate paragraph removal within the page
+    text = _deduplicate_paragraphs_conservatively(text)
+
+    # 6. Check length limits
     is_truncated = False
     if len(text) > MAX_PAGE_CONTENT_CHARS:
         text = text[:MAX_PAGE_CONTENT_CHARS].rsplit("\n", 1)[0].strip()
@@ -283,6 +447,7 @@ def _build_actor_input(
     Crucially configures ``maxCrawlDepth=0`` to ensure ONLY the requested startUrls
     are scraped, and no child links or site crawling occurs.
     """
+    page_timeout = min(max(timeout_seconds // len(urls), 20), 30) if urls else 30
     return {
         "startUrls": [{"url": u} for u in urls],
         # Depth 0 guarantees only startUrls are scraped; no child links are followed.
@@ -296,7 +461,9 @@ def _build_actor_input(
         "removeElementsCssSelector": NOISE_REMOVAL_CSS_SELECTOR,
         "proxyConfiguration": {"useApifyProxy": True},
         "maxRequestRetries": 1,
-        "pageLoadTimeoutSecs": min(timeout_seconds // 2, 45),
+        "pageLoadTimeoutSecs": page_timeout,
+        "navigationTimeoutSecs": page_timeout,
+        "waitUntil": "domcontentloaded",
     }
 
 
@@ -304,14 +471,18 @@ def _run_actor_sync(
     token: str,
     actor_input: dict[str, Any],
     timeout_seconds: int,
-) -> tuple[list[dict[str, Any]], str | None, str | None]:
+) -> tuple[list[dict[str, Any]], str | None, str | None, str | None]:
     """Synchronous worker that calls the Apify Actor via ApifyClient.
 
     Executed in a separate worker thread via ``asyncio.to_thread`` to prevent
     blocking the FastAPI asynchronous event loop.
+
+    Returns:
+        (dataset_items, run_id, error_or_status_message, actor_status)
     """
     client = ApifyClient(token=token)
     run_id: str | None = None
+    actor_status: str | None = None
 
     try:
         start_urls = [item.get("url") for item in actor_input.get("startUrls", [])]
@@ -322,61 +493,86 @@ def _run_actor_sync(
         )
 
         timeout_delta = datetime.timedelta(seconds=timeout_seconds)
+        # Pass logger=None to prevent background log-streaming threads from raising
+        # RemoteProtocolError or streaming transport exceptions.
         run = client.actor(WEBSITE_CONTENT_CRAWLER_ACTOR_ID).call(
             run_input=actor_input,
             run_timeout=timeout_delta,
             wait_duration=timeout_delta,
+            logger=None,
         )
 
         if run is None:
-            return [], None, "Actor.call() returned None; run did not start."
+            return [], None, "Actor.call() returned None; run did not start.", None
 
         run_id = getattr(run, "id", None) or (run.get("id") if isinstance(run, dict) else None)
-        run_status = getattr(run, "status", None) or (run.get("status") if isinstance(run, dict) else None)
+        actor_status = getattr(run, "status", None) or (run.get("status") if isinstance(run, dict) else None)
+        status_message = (
+            getattr(run, "status_message", None)
+            or (run.get("statusMessage") or run.get("status_message") if isinstance(run, dict) else "")
+            or ""
+        )
 
-        logger.info("Actor run '%s' completed with status '%s'.", run_id, run_status)
+        logger.info("Actor run '%s' completed with status '%s'.", run_id, actor_status)
 
-        if run_status != "SUCCEEDED":
-            status_message = (
-                getattr(run, "status_message", None)
-                or (run.get("statusMessage") or run.get("status_message") if isinstance(run, dict) else "")
-                or ""
-            )
-            return (
-                [],
-                run_id,
-                f"Actor run ended with status '{run_status}'"
-                + (f": {status_message}" if status_message else "."),
-            )
-
+        # Attempt to retrieve dataset items whenever a dataset ID is present,
+        # including when run_status is TIMED-OUT or ABORTED, so partial results are preserved.
         dataset_id = (
             getattr(run, "default_dataset_id", None)
             or (run.get("defaultDatasetId") or run.get("default_dataset_id") if isinstance(run, dict) else None)
         )
-        if not dataset_id:
-            return [], run_id, "Actor run succeeded but returned no default dataset ID."
 
-        items = list(client.dataset(dataset_id).iterate_items())
-        logger.info(
-            "Actor run '%s': retrieved %d dataset items from dataset '%s'.",
-            run_id,
-            len(items),
-            dataset_id,
+        items: list[dict[str, Any]] = []
+        if dataset_id:
+            try:
+                items = list(client.dataset(dataset_id).iterate_items())
+                logger.info(
+                    "Actor run '%s': retrieved %d dataset items from dataset '%s' (status: '%s').",
+                    run_id,
+                    len(items),
+                    dataset_id,
+                    actor_status,
+                )
+            except Exception as ds_exc:
+                logger.warning(
+                    "Actor run '%s': failed to retrieve items from dataset '%s': %s",
+                    run_id,
+                    dataset_id,
+                    ds_exc,
+                )
+                items = []
+        else:
+            logger.warning("Actor run '%s' (status '%s') has no default dataset ID.", run_id, actor_status)
+
+        if actor_status == "SUCCEEDED":
+            if not dataset_id:
+                return [], run_id, "Actor run succeeded but returned no default dataset ID.", actor_status
+            return items, run_id, None, actor_status
+
+        # Actor ended with non-SUCCEEDED status (e.g. TIMED-OUT, ABORTED, FAILED)
+        diag_msg = (
+            f"Actor run ended with status '{actor_status}'"
+            + (f": {status_message}" if status_message else ".")
         )
-        return items, run_id, None
+        if not dataset_id:
+            diag_msg += " (No default dataset ID was returned by actor metadata)."
+        elif not items:
+            diag_msg += " (No dataset items were recovered from the run)."
+
+        return items, run_id, diag_msg, actor_status
 
     except ApifyApiError as exc:
         status_code = getattr(exc, "status_code", None)
         msg = getattr(exc, "message", None) or str(exc)
         if status_code in (401, 403):
-            return [], run_id, "Apify authentication failed (HTTP 401/403). Check APIFY_API_TOKEN."
+            return [], run_id, "Apify authentication failed (HTTP 401/403). Check APIFY_API_TOKEN.", actor_status
         if status_code == 404:
-            return [], run_id, f"Apify Actor '{WEBSITE_CONTENT_CRAWLER_ACTOR_ID}' not found (HTTP 404)."
-        return [], run_id, f"Apify API error (HTTP {status_code}): {msg}"
+            return [], run_id, f"Apify Actor '{WEBSITE_CONTENT_CRAWLER_ACTOR_ID}' not found (HTTP 404).", actor_status
+        return [], run_id, f"Apify API error (HTTP {status_code}): {msg}", actor_status
 
     except Exception as exc:
         logger.error("Unexpected error invoking Apify Actor '%s': %s", WEBSITE_CONTENT_CRAWLER_ACTOR_ID, exc)
-        return [], run_id, f"Crawler invocation failed: {exc}"
+        return [], run_id, f"Crawler invocation failed: {exc}", actor_status
 
 
 def _normalize_input_pages(
@@ -555,6 +751,7 @@ async def crawl_selected_pages(
     items: list[dict[str, Any]] = []
     actor_run_id: str | None = None
     last_error: str | None = None
+    actor_final_status: str | None = None
 
     for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
         logger.info(
@@ -563,32 +760,61 @@ async def crawl_selected_pages(
             MAX_TRANSIENT_RETRIES,
             len(urls_to_scrape),
         )
-        items, run_id, last_error = await asyncio.to_thread(
+        sync_res = await asyncio.to_thread(
             _run_actor_sync,
             raw_token,
             actor_input,
             timeout_seconds,
         )
+        if len(sync_res) >= 4:
+            items, run_id, last_error, actor_final_status = sync_res[:4]
+        else:
+            items, run_id, last_error = sync_res[:3]
+            actor_final_status = "SUCCEEDED" if last_error is None else "FAILED"
         if run_id:
             actor_run_id = run_id
 
-        if last_error is None:
+        # If run succeeded, break immediately
+        if last_error is None and actor_final_status == "SUCCEEDED":
             break
 
-        # Permanent errors or timeout failures should not be retried blindly
-        lower_err = last_error.lower()
-        if "401" in last_error or "403" in last_error or "404" in last_error or "timed-out" in lower_err or "timeout" in lower_err:
-            logger.warning("Non-retryable or timeout error encountered from Apify: %s; aborting retries.", last_error)
+        # If partial dataset items were recovered, DO NOT retry a full crawl!
+        # Re-crawling all pages would waste time/cost and likely timeout again.
+        if items:
+            logger.info(
+                "Recovered %d dataset items from run with status '%s'; avoiding full retry.",
+                len(items),
+                actor_final_status,
+            )
             break
+
+        # Non-retryable statuses (Auth errors, Not Found, Actor Timed-out with 0 items, Aborted)
+        if last_error:
+            lower_err = last_error.lower()
+            if (
+                "401" in last_error
+                or "403" in last_error
+                or "404" in last_error
+                or "timed-out" in lower_err
+                or "timeout" in lower_err
+                or (actor_final_status and actor_final_status in ("TIMED-OUT", "ABORTED"))
+            ):
+                logger.warning(
+                    "Non-retryable actor status ('%s') or error ('%s'); aborting retries.",
+                    actor_final_status,
+                    last_error,
+                )
+                break
 
         if attempt < MAX_TRANSIENT_RETRIES:
             logger.warning("Transient crawler error on attempt %d: %s. Retrying...", attempt, last_error)
             await asyncio.sleep(2.0 * attempt)
 
-    # If actor execution failed entirely
-    if last_error is not None and not items:
+    # If actor execution yielded zero items (total failure, timeout with 0 items, or auth error)
+    if not items:
+        err_msg = last_error or "Actor execution failed to return any dataset items."
         failed_list = [
-            FailedPageScrape(url=orig_u, error_message=f"Actor execution failed: {last_error}", page_type=pt)
+            FailedPageScrape(url=orig_u, error_message=f"Actor execution failed: {err_msg}", page_type=pt)
             for orig_u, pt, _ in valid_targets.values()
         ] + immediate_failures
         return WebsiteCrawlResult(
@@ -601,8 +827,9 @@ async def crawl_selected_pages(
             total_failed=len(failed_list),
             has_usable_content=False,
             actor_run_id=actor_run_id,
+            actor_status=actor_final_status,
             execution_time_seconds=round(time.monotonic() - start_time, 2),
-            error_message=last_error,
+            error_message=err_msg,
         )
 
     # 6. Parse and validate returned dataset items
@@ -669,16 +896,8 @@ async def crawl_selected_pages(
             )
             continue
 
-        # Extract content (markdown preferred, then text, then HTML)
-        raw_content = item.get("markdown") or item.get("text") or item.get("content") or ""
-        if not raw_content and item.get("html"):
-            try:
-                soup = BeautifulSoup(item["html"], "html.parser")
-                for tag in soup(["script", "style", "nav", "header", "footer"]):
-                    tag.decompose()
-                raw_content = soup.get_text(separator="\n")
-            except Exception:
-                pass
+        # Extract content using best available representation (Fix 5)
+        raw_content = _extract_best_content(item)
 
         cleaned_text, is_blocked, is_truncated = _clean_page_content(raw_content)
 
@@ -687,7 +906,7 @@ async def crawl_selected_pages(
                 FailedPageScrape(
                     url=orig_url,
                     error_message="Page access denied or bot challenge detected.",
-                    status_code=status_code or 403,
+                    status_code=status_code,
                     page_type=p_type,
                 )
             )
@@ -715,13 +934,13 @@ async def crawl_selected_pages(
         if extracted_title:
             extracted_title = extracted_title.strip()
 
-        # Build ScrapedPage schema instance
+        # Build ScrapedPage schema instance with honest HTTP status (Fix 6)
         scraped_page = ScrapedPage(
             url=orig_url,
             title=extracted_title,
             content=cleaned_text,
             page_type=p_type,
-            status_code=status_code or 200,
+            status_code=status_code,
             metadata={
                 "requested_url": orig_url,
                 "final_url": item_url or orig_url,
@@ -737,10 +956,17 @@ async def crawl_selected_pages(
     # 7. Identify requested pages that were missing from dataset results
     for norm_u, (orig_u, p_type, _) in valid_targets.items():
         if norm_u not in processed_targets:
+            if actor_final_status == "TIMED-OUT":
+                miss_err = "Page not scraped: crawler run timed out before completion."
+            elif actor_final_status and actor_final_status != "SUCCEEDED":
+                miss_err = f"Page not scraped: crawler run ended with status '{actor_final_status}'."
+            else:
+                miss_err = "Page was not returned in the crawler dataset output."
+
             page_failures.append(
                 FailedPageScrape(
                     url=orig_u,
-                    error_message="Page was not returned in the crawler dataset output.",
+                    error_message=miss_err,
                     page_type=p_type,
                 )
             )
@@ -750,18 +976,20 @@ async def crawl_selected_pages(
     total_failed = len(page_failures)
     has_usable_content = total_scraped > 0
 
-    if total_scraped == total_requested:
+    if total_scraped == total_requested and actor_final_status == "SUCCEEDED":
         overall_status: Literal["success", "partial", "empty", "failed"] = "success"
     elif total_scraped > 0:
         overall_status = "partial"
     else:
-        overall_status = "failed"
+        # Items were returned, but none produced usable content (all blocked or empty)
+        overall_status = "empty" if any(f.error_message and "too short" in f.error_message for f in page_failures) else "failed"
 
     exec_time = round(time.monotonic() - start_time, 2)
     logger.info(
-        "Website content crawler finished for %s: status=%s, scraped=%d/%d, failed=%d (time=%.2fs).",
+        "Website content crawler finished for %s: status=%s (actor_status=%s), scraped=%d/%d, failed=%d (time=%.2fs).",
         resolved_website_url,
         overall_status,
+        actor_final_status,
         total_scraped,
         total_requested,
         total_failed,
@@ -778,6 +1006,7 @@ async def crawl_selected_pages(
         total_failed=total_failed,
         has_usable_content=has_usable_content,
         actor_run_id=actor_run_id,
+        actor_status=actor_final_status,
         execution_time_seconds=exec_time,
         error_message=last_error,
     )

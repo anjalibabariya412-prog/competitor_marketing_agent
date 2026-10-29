@@ -175,10 +175,16 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
 
     # 5. Handle complete crawl failure (0 scraped pages or no usable content)
     if not crawl_result.has_usable_content or crawl_result.total_scraped == 0 or crawl_result.status in ("failed", "empty"):
-        error_msg = (
-            f"Website crawling yielded 0 usable pages for '{clean_url}': "
-            f"{crawl_result.error_message or 'All requested pages failed during scraping.'}"
-        )
+        if getattr(crawl_result, "actor_status", None) == "TIMED-OUT":
+            error_msg = (
+                f"Website crawling timed out and yielded 0 usable pages for '{clean_url}': "
+                f"{crawl_result.error_message or 'Actor timed out before returning any readable content.'}"
+            )
+        else:
+            error_msg = (
+                f"Website crawling yielded 0 usable pages for '{clean_url}': "
+                f"{crawl_result.error_message or 'All requested pages failed during scraping.'}"
+            )
         logger.warning("Website Crawling Node failure: %s", error_msg)
         existing_errors = list(state.get("errors") or [])
         existing_errors.append(error_msg)
@@ -212,10 +218,13 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
 
     if crawl_result.status == "partial" or crawl_result.total_failed > 0:
         existing_errors = list(state.get("errors") or [])
-        existing_errors.append(
+        advisory = (
             f"Website crawling advisory: {crawl_result.total_failed} of {crawl_result.total_requested} "
             f"pages failed to scrape for '{clean_url}'."
         )
+        if getattr(crawl_result, "actor_status", None) == "TIMED-OUT":
+            advisory += f" (Actor timed out; {crawl_result.total_scraped} partial pages recovered)."
+        existing_errors.append(advisory)
         update["errors"] = existing_errors
 
     return update
