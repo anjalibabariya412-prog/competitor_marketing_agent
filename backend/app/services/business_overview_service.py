@@ -21,6 +21,7 @@ Key Responsibilities:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import urllib.parse
 from typing import Any, Literal, Sequence
@@ -593,6 +594,77 @@ def _resolve_and_verify_source_url(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Customer-Facing Language Sanitization Rules
+# ---------------------------------------------------------------------------
+
+CUSTOMER_FACING_REPLACEMENT_RULES: tuple[tuple[re.Pattern, str], ...] = (
+    # Compound phrases with excerpts
+    (re.compile(r'\b(the\s+)?(?:crawled|supplied|scraped|provided)\s+(?:page|content)\s+excerpts?\b', re.IGNORECASE), r'\1reviewed page content'),
+    (re.compile(r'\b(the\s+)?(?:page|content)\s+excerpts?\b', re.IGNORECASE), r'\1reviewed page content'),
+
+    # Supplied product pages / pages / content / text / website
+    (re.compile(r'\b(the\s+)?supplied\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
+    (re.compile(r'\b(the\s+)?supplied\s+website\s+(content|text)\b', re.IGNORECASE), r'\1website \2'),
+    (re.compile(r'\b(the\s+)?supplied\s+(content|text|data|materials?)\b', re.IGNORECASE), r'\1reviewed \2'),
+    (re.compile(r'\b(the\s+)?supplied\s+website\b', re.IGNORECASE), r'\1website'),
+
+    # Crawled pages / collections / content / text / website
+    (re.compile(r'\b(the\s+)?crawled\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?|collections?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
+    (re.compile(r'\b(the\s+)?crawled\s+website\s+(content|text)\b', re.IGNORECASE), r'\1website \2'),
+    (re.compile(r'\b(the\s+)?crawled\s+(content|text|data|materials?)\b', re.IGNORECASE), r'\1reviewed \2'),
+    (re.compile(r'\b(the\s+)?crawled\s+website\b', re.IGNORECASE), r'\1website'),
+
+    # Scraped pages / content / text / website
+    (re.compile(r'\b(the\s+)?scraped\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
+    (re.compile(r'\b(the\s+)?scraped\s+(content|text|data|materials?|website)\b', re.IGNORECASE), r'\1reviewed \2'),
+
+    # Provided website text / provided content / provided pages
+    (re.compile(r'\b(the\s+)?provided\s+website\s+text\b', re.IGNORECASE), r'\1website text'),
+    (re.compile(r'\b(the\s+)?provided\s+(content|text|data|materials?)\b', re.IGNORECASE), r'\1reviewed \2'),
+    (re.compile(r'\b(the\s+)?provided\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
+
+    # Content / pages we analyzed / crawled / scraped
+    (re.compile(r'\b(the\s+)?content\s+we\s+analyzed\b', re.IGNORECASE), r'\1reviewed content'),
+    (re.compile(r'\b(the\s+)?pages\s+we\s+(?:analyzed|crawled|scraped)\b', re.IGNORECASE), r'\1reviewed pages'),
+
+    # Internal crawler/scraper agent actions
+    (re.compile(r'\b(?:reported|identified|found)\s+by\s+the\s+(?:crawler|scraper)\b', re.IGNORECASE), 'found on the reviewed pages'),
+    (re.compile(r'\bthe\s+(?:crawler|scraper)\s+(?:did\s+not\s+find|could\s+not\s+find)\b', re.IGNORECASE), 'the reviewed pages did not show'),
+    (re.compile(r'\bthe\s+(?:crawler|scraper)\s+reports?\b', re.IGNORECASE), 'the reviewed pages indicate'),
+)
+
+
+def _case_adaptive_sub(pattern: re.Pattern, template: str, text: str) -> str:
+    """Substitute pattern matches while preserving all-caps or title-case capitalization."""
+    def replacer(match: re.Match) -> str:
+        orig = match.group(0)
+        sub = match.expand(template)
+        if orig.isupper():
+            return sub.upper()
+        if orig and orig[0].isupper():
+            return sub[0].upper() + sub[1:]
+        return sub
+
+    return pattern.sub(replacer, text)
+
+
+def sanitize_customer_facing_text(text: str) -> str:
+    """Sanitize customer-facing descriptive strings to remove internal crawling and processing jargon.
+
+    Preserves exact pricing, variant, URL, and audience evidence without hallucinating
+    or converting meaningful uncertainty into definitive claims.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    sanitized = text
+    for pattern, template in CUSTOMER_FACING_REPLACEMENT_RULES:
+        sanitized = _case_adaptive_sub(pattern, template, sanitized)
+
+    return sanitized
+
+
 def _sanitize_and_validate_overview(
     overview: BusinessOverview,
     valid_source_urls: Sequence[str] | set[str] | Sequence[ScrapedPage],
@@ -794,6 +866,33 @@ def _sanitize_and_validate_overview(
         # Preserve business description from intake if overview is empty
         if not overview.business_description or overview.business_description.strip() in ("", "unknown"):
             overview.business_description = stated_name_desc
+
+    # 7. Customer-Facing Language Sanitization (removes internal crawling/processing jargon)
+    overview.business_description = sanitize_customer_facing_text(overview.business_description)
+    overview.conflicts = [sanitize_customer_facing_text(c) for c in overview.conflicts]
+
+    for gap in overview.information_gaps:
+        gap.observation = sanitize_customer_facing_text(gap.observation)
+        gap.category = sanitize_customer_facing_text(gap.category)
+
+    for vp in overview.positioning_and_value_propositions:
+        vp.statement = sanitize_customer_facing_text(vp.statement)
+
+    if overview.target_audience and overview.target_audience.description:
+        overview.target_audience.description = sanitize_customer_facing_text(overview.target_audience.description)
+
+    for p in overview.products_and_services:
+        p.description = sanitize_customer_facing_text(p.description)
+        p.features = [sanitize_customer_facing_text(f) for f in p.features]
+        p.benefits = [sanitize_customer_facing_text(b) for b in p.benefits]
+        if p.pricing:
+            if p.pricing.discount_text:
+                p.pricing.discount_text = sanitize_customer_facing_text(p.pricing.discount_text)
+            if p.pricing.trial_or_guarantee:
+                p.pricing.trial_or_guarantee = sanitize_customer_facing_text(p.pricing.trial_or_guarantee)
+
+    for finding in overview.key_findings:
+        finding.statement = sanitize_customer_facing_text(finding.statement)
 
     logger.info(
         "[business_overview_trace] [CHECKPOINT 5: sanitization] Sanitization complete: %d findings verified, %d dropped. %d verified sources in sources_used, %d conflicts detected.",

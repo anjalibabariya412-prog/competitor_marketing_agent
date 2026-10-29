@@ -54,6 +54,21 @@ logger = logging.getLogger(__name__)
 # Verified Apify Actor specifically designed for LLM/AI content extraction
 WEBSITE_CONTENT_CRAWLER_ACTOR_ID: str = "apify/website-content-crawler"
 
+# Apify Actor execution lifecycle statuses
+TERMINAL_STATUSES: frozenset[str] = frozenset({
+    "SUCCEEDED",
+    "FAILED",
+    "TIMED-OUT",
+    "ABORTED",
+})
+
+NON_TERMINAL_STATUSES: frozenset[str] = frozenset({
+    "READY",
+    "RUNNING",
+    "TIMING-OUT",
+    "ABORTING",
+})
+
 # Default maximum number of pages to scrape per crawl run
 DEFAULT_MAX_PAGES: int = 10
 
@@ -483,6 +498,8 @@ def _run_actor_sync(
     client = ApifyClient(token=token)
     run_id: str | None = None
     actor_status: str | None = None
+    start_time = time.monotonic()
+    deadline = start_time + timeout_seconds
 
     try:
         start_urls = [item.get("url") for item in actor_input.get("startUrls", [])]
@@ -493,13 +510,10 @@ def _run_actor_sync(
         )
 
         timeout_delta = datetime.timedelta(seconds=timeout_seconds)
-        # Pass logger=None to prevent background log-streaming threads from raising
-        # RemoteProtocolError or streaming transport exceptions.
         run = client.actor(WEBSITE_CONTENT_CRAWLER_ACTOR_ID).call(
             run_input=actor_input,
             run_timeout=timeout_delta,
             wait_duration=timeout_delta,
-            logger=None,
         )
 
         if run is None:
@@ -513,16 +527,50 @@ def _run_actor_sync(
             or ""
         )
 
-        logger.info("Actor run '%s' completed with status '%s'.", run_id, actor_status)
+        logger.info("Actor run '%s' initial status: '%s'.", run_id, actor_status)
 
-        # Attempt to retrieve dataset items whenever a dataset ID is present,
-        # including when run_status is TIMED-OUT or ABORTED, so partial results are preserved.
+        # 1. Handle nonterminal status: if run has not reached a terminal status, wait boundedly
+        if actor_status not in TERMINAL_STATUSES and run_id:
+            logger.info(
+                "Actor run '%s' returned with nonterminal status '%s'; waiting for terminal status...",
+                run_id,
+                actor_status,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    wait_delta = datetime.timedelta(seconds=max(1.0, remaining))
+                    run_client = client.run(run_id)
+                    updated_run = run_client.wait_for_finish(wait_duration=wait_delta)
+                    if updated_run is not None:
+                        run = updated_run
+                        actor_status = getattr(run, "status", None) or (run.get("status") if isinstance(run, dict) else None)
+                        status_message = (
+                            getattr(run, "status_message", None)
+                            or (run.get("statusMessage") or run.get("status_message") if isinstance(run, dict) else "")
+                            or status_message
+                        )
+                        logger.info("Actor run '%s' after waiting reached status '%s'.", run_id, actor_status)
+                except Exception as wait_exc:
+                    logger.warning("Error waiting for Actor run '%s' to finish: %s", run_id, wait_exc)
+
+        # If still nonterminal after waiting (deadline expired while still running/ready)
+        if actor_status not in TERMINAL_STATUSES:
+            err_msg = (
+                f"Actor run '{run_id}' remained nonterminal ('{actor_status}') when the operation deadline ({timeout_seconds}s) expired."
+            )
+            logger.warning(err_msg)
+            return [], run_id, err_msg, actor_status
+
+        # 2. Terminal status reached: retrieve dataset items
         dataset_id = (
             getattr(run, "default_dataset_id", None)
             or (run.get("defaultDatasetId") or run.get("default_dataset_id") if isinstance(run, dict) else None)
         )
 
         items: list[dict[str, Any]] = []
+        dataset_error: str | None = None
+
         if dataset_id:
             try:
                 items = list(client.dataset(dataset_id).iterate_items())
@@ -534,32 +582,46 @@ def _run_actor_sync(
                     actor_status,
                 )
             except Exception as ds_exc:
+                dataset_error = f"Failed to retrieve items from dataset '{dataset_id}': {ds_exc}"
                 logger.warning(
-                    "Actor run '%s': failed to retrieve items from dataset '%s': %s",
+                    "Actor run '%s': %s",
                     run_id,
-                    dataset_id,
-                    ds_exc,
+                    dataset_error,
                 )
                 items = []
         else:
-            logger.warning("Actor run '%s' (status '%s') has no default dataset ID.", run_id, actor_status)
+            logger.warning("Actor run '%s' (status '%s') has no default dataset ID in metadata.", run_id, actor_status)
 
+        # 3. Formulate outcome distinguishing actor status from dataset outcome
         if actor_status == "SUCCEEDED":
+            if dataset_error:
+                return [], run_id, f"Actor run succeeded, but dataset retrieval failed: {dataset_error}", actor_status
             if not dataset_id:
-                return [], run_id, "Actor run succeeded but returned no default dataset ID.", actor_status
+                return [], run_id, "Actor run succeeded, but returned no default dataset ID in metadata.", actor_status
+            if not items:
+                return [], run_id, f"Actor run succeeded, but default dataset '{dataset_id}' was empty.", actor_status
             return items, run_id, None, actor_status
 
-        # Actor ended with non-SUCCEEDED status (e.g. TIMED-OUT, ABORTED, FAILED)
-        diag_msg = (
-            f"Actor run ended with status '{actor_status}'"
-            + (f": {status_message}" if status_message else ".")
-        )
-        if not dataset_id:
-            diag_msg += " (No default dataset ID was returned by actor metadata)."
-        elif not items:
-            diag_msg += " (No dataset items were recovered from the run)."
+        if actor_status == "TIMED-OUT":
+            base_msg = f"Actor run ended with status 'TIMED-OUT'" + (f": {status_message}" if status_message else ".")
+            if dataset_error:
+                return [], run_id, f"{base_msg} Dataset retrieval failed: {dataset_error}", actor_status
+            if not dataset_id:
+                return [], run_id, f"{base_msg} No default dataset ID was returned in actor metadata.", actor_status
+            if not items:
+                return [], run_id, f"{base_msg} No dataset items were recovered from dataset '{dataset_id}'.", actor_status
+            # Partial results recovered
+            diag_msg = f"{base_msg} ({len(items)} partial items recovered from dataset '{dataset_id}')."
+            return items, run_id, diag_msg, actor_status
 
-        return items, run_id, diag_msg, actor_status
+        # actor_status in ("FAILED", "ABORTED") or other terminal status
+        base_msg = f"Actor run ended with status '{actor_status}'" + (f": {status_message}" if status_message else ".")
+        if dataset_error:
+            return [], run_id, f"{base_msg} Dataset retrieval failed: {dataset_error}", actor_status
+        if items:
+            diag_msg = f"{base_msg} ({len(items)} partial items recovered from dataset '{dataset_id}')."
+            return items, run_id, diag_msg, actor_status
+        return [], run_id, base_msg, actor_status
 
     except ApifyApiError as exc:
         status_code = getattr(exc, "status_code", None)
@@ -788,7 +850,35 @@ async def crawl_selected_pages(
             )
             break
 
-        # Non-retryable statuses (Auth errors, Not Found, Actor Timed-out with 0 items, Aborted)
+        # Do not launch duplicate actor runs if:
+        # - Actor is nonterminal (RUNNING, READY) -> still active on platform!
+        # - Actor already succeeded (even if dataset read failed)
+        # - Actor TIMED-OUT or ABORTED
+        # - Auth or Not Found errors
+        if actor_final_status in NON_TERMINAL_STATUSES:
+            logger.warning(
+                "Actor run '%s' remained nonterminal ('%s'); aborting retries without starting duplicate crawl.",
+                actor_run_id,
+                actor_final_status,
+            )
+            break
+
+        if actor_final_status == "SUCCEEDED" and last_error:
+            logger.warning(
+                "Actor run '%s' already completed successfully, but dataset retrieval encountered an error (%s); avoiding duplicate actor run.",
+                actor_run_id,
+                last_error,
+            )
+            break
+
+        if actor_final_status in ("TIMED-OUT", "ABORTED"):
+            logger.warning(
+                "Actor run '%s' ended with terminal status '%s'; aborting retries.",
+                actor_run_id,
+                actor_final_status,
+            )
+            break
+
         if last_error:
             lower_err = last_error.lower()
             if (
@@ -797,11 +887,9 @@ async def crawl_selected_pages(
                 or "404" in last_error
                 or "timed-out" in lower_err
                 or "timeout" in lower_err
-                or (actor_final_status and actor_final_status in ("TIMED-OUT", "ABORTED"))
             ):
                 logger.warning(
-                    "Non-retryable actor status ('%s') or error ('%s'); aborting retries.",
-                    actor_final_status,
+                    "Non-retryable error ('%s'); aborting retries.",
                     last_error,
                 )
                 break
@@ -810,11 +898,20 @@ async def crawl_selected_pages(
             logger.warning("Transient crawler error on attempt %d: %s. Retrying...", attempt, last_error)
             await asyncio.sleep(2.0 * attempt)
 
-    # If actor execution yielded zero items (total failure, timeout with 0 items, or auth error)
+    # If actor execution yielded zero items (total failure, timeout with 0 items, nonterminal, or dataset failure)
     if not items:
         err_msg = last_error or "Actor execution failed to return any dataset items."
+        if actor_final_status in NON_TERMINAL_STATUSES:
+            page_err = f"Page not scraped: crawler run remained nonterminal ('{actor_final_status}') when the operation deadline expired."
+        elif actor_final_status == "TIMED-OUT":
+            page_err = "Page not scraped: crawler run timed out before completion."
+        elif actor_final_status and actor_final_status != "SUCCEEDED":
+            page_err = f"Page not scraped: crawler run ended with status '{actor_final_status}'."
+        else:
+            page_err = f"Page not scraped: {err_msg}"
+
         failed_list = [
-            FailedPageScrape(url=orig_u, error_message=f"Actor execution failed: {err_msg}", page_type=pt)
+            FailedPageScrape(url=orig_u, error_message=page_err, page_type=pt)
             for orig_u, pt, _ in valid_targets.values()
         ] + immediate_failures
         return WebsiteCrawlResult(

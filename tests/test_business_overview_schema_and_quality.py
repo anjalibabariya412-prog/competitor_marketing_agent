@@ -763,6 +763,252 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
         self.assertIn('"offering_type":"product"', json_output)
         self.assertIn('"billing_period":"per session"', json_output)
 
+    # --- Scenario 19: System prompt contains customer-facing language rules ---
+    def test_19_customer_facing_language_rules_in_system_prompt(self) -> None:
+        """Verify BUSINESS_OVERVIEW_SYSTEM_PROMPT includes CUSTOMER-FACING LANGUAGE RULES."""
+        from backend.app.agent.prompts.business_overview import BUSINESS_OVERVIEW_SYSTEM_PROMPT
+
+        self.assertIn("CUSTOMER-FACING LANGUAGE RULES", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("Never mention internal data collection, crawling, scraping", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("crawled page", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("supplied pages", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("page excerpt", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("the content we analyzed", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("Scope the statement accurately", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("Do not turn uncertainty into a definitive claim", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+
+    # --- Scenario 20: Sanitization removes forbidden processing phrases ---
+    def test_20_customer_facing_language_sanitization_removes_leakage(self) -> None:
+        """Verify leakage phrases are rewritten naturally without losing meaning or evidence."""
+        from backend.app.services.business_overview_service import sanitize_customer_facing_text
+
+        test_cases = [
+            (
+                "The supplied concealer product pages do not show a price.",
+                "The reviewed concealer product pages do not show a price.",
+            ),
+            (
+                "The crawled page reports zero search results.",
+                "The reviewed page reports zero search results.",
+            ),
+            (
+                "The crawled content does not establish current stock status.",
+                "The reviewed content does not establish current stock status.",
+            ),
+            (
+                "The supplied pages do not contain founder details.",
+                "The reviewed pages do not contain founder details.",
+            ),
+            (
+                "The page excerpt does not state shipping fees.",
+                "The reviewed page content does not state shipping fees.",
+            ),
+            (
+                "The provided website text describes the company as a leader.",
+                "The website text describes the company as a leader.",
+            ),
+            (
+                "In the content we analyzed, pricing is quote-based.",
+                "In the reviewed content, pricing is quote-based.",
+            ),
+            (
+                "The pages we crawled list three active promotions.",
+                "The reviewed pages list three active promotions.",
+            ),
+        ]
+
+        forbidden = [
+            "crawled page", "crawled content", "supplied pages",
+            "page excerpt", "the content we analyzed", "provided website text",
+            "pages we crawled",
+        ]
+
+        for original, expected in test_cases:
+            result = sanitize_customer_facing_text(original)
+            self.assertEqual(result, expected)
+            for phrase in forbidden:
+                self.assertNotIn(phrase, result.lower())
+
+    # --- Scenario 21: Case-insensitivity and capitalization handling ---
+    def test_21_case_insensitivity_and_capitalization_handling(self) -> None:
+        """Verify uppercase, titlecase, and lowercase variations of leakage phrases are cleaned."""
+        from backend.app.services.business_overview_service import sanitize_customer_facing_text
+
+        inputs = [
+            ("CRAWLED CONTENT does not list price.", "REVIEWED CONTENT does not list price."),
+            ("SUPPLIED PAGES do not list founders.", "REVIEWED PAGES do not list founders."),
+            ("crawled page indicates out of stock.", "reviewed page indicates out of stock."),
+            ("PAGE EXCERPT confirms formulation.", "REVIEWED PAGE CONTENT confirms formulation."),
+            ("Crawled Pages report seasonal discounts.", "Reviewed Pages report seasonal discounts."),
+        ]
+
+        for inp, expected in inputs:
+            cleaned = sanitize_customer_facing_text(inp)
+            self.assertEqual(cleaned, expected)
+
+    # --- Scenario 22: All nested output fields sanitized in _sanitize_and_validate_overview ---
+    def test_22_all_nested_output_fields_sanitized(self) -> None:
+        """Verify that every customer-facing string field across the overview hierarchy is sanitized."""
+        overview = BusinessOverview(
+            business_name="Aura Skincare",
+            website_url="https://aura-skincare.example.com",
+            business_description="The crawled content shows Aura Skincare creates botanical products.",
+            products_and_services=[
+                ProductServiceItem(
+                    name="Hydrating Glow Serum",
+                    offering_type=OfferingType.PRODUCT,
+                    description="The supplied concealer product pages do not show a price.",
+                    features=["Extracted from the crawled page: lightweight hydration"],
+                    benefits=["The page excerpt highlights 24hr moisture"],
+                    pricing=PricingInfo(
+                        price="$38.00",
+                        discount_text="The crawled page reports 15% discount with code GLOW15",
+                        trial_or_guarantee="The supplied pages mention 30-day trial",
+                        availability=PriceAvailability.AVAILABLE,
+                    ),
+                    source_url="https://aura-skincare.example.com/products/hydrating-serum",
+                ),
+            ],
+            target_audience=TargetAudienceInfo(
+                description="The provided website text indicates urban professionals.",
+                is_explicit=True,
+                source_url="https://aura-skincare.example.com/",
+            ),
+            positioning_and_value_propositions=[
+                ValueProposition(
+                    statement="In the content we analyzed, the brand claims botanical purity.",
+                    is_explicit=True,
+                    source_url="https://aura-skincare.example.com/",
+                )
+            ],
+            conflicts=[
+                "The supplied pages contradict user intake regarding B2B vs B2C focus."
+            ],
+            information_gaps=[
+                InformationGap(
+                    category="Pricing",
+                    observation="The crawled page reports no published pricing for custom orders.",
+                )
+            ],
+            key_findings=[
+                Finding(
+                    statement="The pages we crawled show high botanical ingredient concentration.",
+                    finding_type=FindingType.POSITIONING,
+                    source_url="https://aura-skincare.example.com/",
+                )
+            ],
+            sources_used=[],
+        )
+
+        sanitized = _sanitize_and_validate_overview(overview, self.crawled_pages, self.sample_form)
+
+        forbidden = [
+            "crawled content", "supplied concealer product pages",
+            "the crawled page", "the page excerpt", "provided website text",
+            "content we analyzed", "the supplied pages", "the pages we crawled",
+        ]
+
+        def check_no_leakage(text: str) -> None:
+            for phrase in forbidden:
+                self.assertNotIn(phrase, text.lower(), f"Leakage '{phrase}' found in: {text}")
+
+        check_no_leakage(sanitized.business_description)
+        check_no_leakage(sanitized.target_audience.description)
+        check_no_leakage(sanitized.conflicts[0])
+        check_no_leakage(sanitized.information_gaps[0].observation)
+        check_no_leakage(sanitized.positioning_and_value_propositions[0].statement)
+        check_no_leakage(sanitized.key_findings[0].statement)
+
+        item = sanitized.products_and_services[0]
+        check_no_leakage(item.description)
+        check_no_leakage(item.features[0])
+        check_no_leakage(item.benefits[0])
+        self.assertIsNotNone(item.pricing)
+        check_no_leakage(item.pricing.discount_text)
+        check_no_leakage(item.pricing.trial_or_guarantee)
+
+    # --- Scenario 23: Preserves meaning, uncertainty, and structured metadata ---
+    def test_23_preserves_meaning_uncertainty_and_structured_metadata(self) -> None:
+        """Verify source URLs, pricing values, variants, and honest uncertainty remain intact."""
+        overview = BusinessOverview(
+            business_name="Aura Skincare",
+            website_url="https://aura-skincare.example.com",
+            business_description="The supplied pages indicate high quality.",
+            products_and_services=[
+                ProductServiceItem(
+                    name="CRAZE Blush pH-lease",
+                    offering_type=OfferingType.PRODUCT,
+                    description="The crawled page reports pH-adaptive blush.",
+                    variants=["Cheeky Pink", "Peach Glow"],
+                    pricing=PricingInfo(
+                        price="₹269",
+                        original_price="₹399",
+                        currency="INR",
+                        discount_text="Coupon: ₹175",
+                        availability=PriceAvailability.AVAILABLE,
+                    ),
+                    source_url="https://aura-skincare.example.com/products/hydrating-serum",
+                    source_urls=["https://aura-skincare.example.com/products/hydrating-serum"],
+                ),
+            ],
+            target_audience=TargetAudienceInfo(
+                description="Current audience could not be verified on reviewed pages.",
+                is_explicit=False,
+                user_stated_audience="Urban professionals aged 25-45 seeking clean skincare",
+            ),
+            positioning_and_value_propositions=[],
+            information_gaps=[
+                InformationGap(
+                    category="Pricing & Plans",
+                    observation="Current prices for these concealers are not listed on the reviewed product pages.",
+                )
+            ],
+            key_findings=[],
+            sources_used=[],
+            conflicts=[],
+        )
+
+        sanitized = _sanitize_and_validate_overview(overview, self.crawled_pages, self.sample_form)
+
+        # Source URLs intact
+        self.assertEqual(sanitized.products_and_services[0].source_url, "https://aura-skincare.example.com/products/hydrating-serum")
+        self.assertEqual(sanitized.sources_used, ["https://aura-skincare.example.com/products/hydrating-serum"])
+
+        # Structured pricing intact
+        pricing = sanitized.products_and_services[0].pricing
+        self.assertIsNotNone(pricing)
+        self.assertEqual(pricing.price, "₹269")
+        self.assertEqual(pricing.original_price, "₹399")
+        self.assertEqual(pricing.currency, "INR")
+        self.assertEqual(pricing.discount_text, "Coupon: ₹175")
+        self.assertEqual(pricing.availability, PriceAvailability.AVAILABLE)
+
+        # Product variants intact
+        self.assertEqual(sanitized.products_and_services[0].variants, ["Cheeky Pink", "Peach Glow"])
+
+        # User-stated audience intact
+        self.assertEqual(sanitized.target_audience.user_stated_audience, "Urban professionals aged 25-45 seeking clean skincare")
+
+        # Uncertainty preserved (not turned into site-wide claim)
+        self.assertIn("not listed on the reviewed product pages", sanitized.information_gaps[0].observation)
+
+    # --- Scenario 24: No corruption of legitimate business and technical terms ---
+    def test_24_no_corruption_of_unrelated_content_or_products(self) -> None:
+        """Verify that legitimate product descriptions mentioning web technologies are not damaged."""
+        from backend.app.services.business_overview_service import sanitize_customer_facing_text
+
+        phrases = [
+            "We offer a real-time web crawler software package for indexing.",
+            "Our web scraper tool extracts public pricing intelligence.",
+            "Features include automated web browser automation and data export.",
+            "Swiss Beauty Craze Blush features a lightweight, velvety formula.",
+        ]
+
+        for p in phrases:
+            cleaned = sanitize_customer_facing_text(p)
+            self.assertEqual(cleaned, p)
+
+
 
 if __name__ == "__main__":
     unittest.main()

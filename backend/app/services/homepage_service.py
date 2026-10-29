@@ -332,7 +332,6 @@ def _run_actor_sync(
             run_input=actor_input,
             run_timeout=timeout_delta,
             wait_duration=timeout_delta,
-            logger=None,
         )
 
         if run is None:

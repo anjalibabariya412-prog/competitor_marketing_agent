@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 PAGE_SELECTION_MODEL: str = settings.LLM_MODEL
 
 # Default maximum number of pages to select for competitive analysis
-DEFAULT_MAX_SELECTED_PAGES: int = 8
+DEFAULT_MAX_SELECTED_PAGES: int = 10
 
 # Upper bound on candidate URLs sent to LLM prompt to keep latency and token costs minimal
 MAX_PROMPT_CANDIDATES: int = 60

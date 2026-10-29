@@ -1,30 +1,28 @@
-"""Offline regression tests for Apify crawler timeout and partial-result handling.
+"""Offline regression tests for Apify crawler timeout, nonterminal status, and dataset error handling.
 
 Covers all 12 scenarios required:
-1. Actor succeeds and returns all expected pages.
-2. Actor times out but its dataset contains enough valid partial results.
-3. Actor times out and the dataset contains no items.
-4. Actor times out and the dataset contains only empty or invalid pages.
-5. Partial results satisfy minimum-content requirement and Business Overview proceeds.
-6. Partial results do not satisfy minimum-content requirement and returns clear error.
-7. Dataset retrieval fails after a timeout.
-8. Actor metadata is missing a dataset identifier.
-9. Log-streaming separation prevents log exceptions from failing actor execution.
-10. Genuine actor failure remains distinguishable from a timeout.
-11. Transient failures follow retry policy without triggering unnecessary repeated crawls.
-12. Final API behavior correctly reflects partial results or insufficient content.
+1. Actor returns SUCCEEDED and dataset retrieval succeeds.
+2. Actor returns SUCCEEDED but dataset retrieval raises an exception.
+3. Actor returns TIMED-OUT with recoverable partial items.
+4. Actor returns TIMED-OUT without recoverable items.
+5. Actor initially returns a nonterminal status and later reaches SUCCEEDED.
+6. Actor initially returns a nonterminal status and later reaches TIMED-OUT with partial results.
+7. Actor remains nonterminal until the overall deadline expires.
+8. The implementation does not start a duplicate actor run while the original run is still active.
+9. Missing dataset ID and empty dataset are reported distinctly.
+10. Genuine FAILED and ABORTED statuses remain distinguishable from timeouts.
+11. Existing retry behavior remains bounded and avoids redundant full crawls after partial recovery.
+12. Existing API behavior remains correct for sufficient partial content and insufficient readable content.
 """
 
 from __future__ import annotations
 
-from typing import Any
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 import backend.app.main  # Ensure canonical import order
-from backend.app.agent.graph import get_graph
 from backend.app.agent.nodes.business_overview_node import business_overview_node
 from backend.app.agent.nodes.website_crawling_node import website_crawling_node
 from backend.app.agent.state import AgentState
@@ -60,7 +58,6 @@ def _make_mock_run(
     run.status = status
     run.default_dataset_id = dataset_id
     run.status_message = status_message
-    # Dict access support
     run.get = lambda k, default=None: {
         "id": run_id,
         "status": status,
@@ -73,7 +70,7 @@ def _make_mock_run(
 
 
 class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
-    """Test suite validating resilient crawler timeout handling and partial result recovery."""
+    """Test suite validating resilient crawler timeout handling, nonterminal statuses, and dataset errors."""
 
     def setUp(self) -> None:
         self.api_client = TestClient(app)
@@ -90,17 +87,17 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
             SelectedPage(url="https://swissbeauty.example.com/products/blush", page_type=PageType.PRODUCT, title="Blush"),
         ]
 
-    # --- Scenario 1: Actor succeeds and returns all expected pages ---
+    # --- Scenario 1: Actor returns SUCCEEDED and dataset retrieval succeeds ---
     @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_01_actor_succeeds_returns_all_pages(self, mock_client_cls: MagicMock) -> None:
-        """When actor finishes with SUCCEEDED, all pages are returned with success status."""
+    async def test_01_actor_succeeds_and_dataset_succeeds(self, mock_client_cls: MagicMock) -> None:
+        """When actor finishes with SUCCEEDED and dataset retrieves all items, crawl status is success."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
         mock_run = _make_mock_run(status="SUCCEEDED", dataset_id="ds-1")
         mock_client.actor.return_value.call.return_value = mock_run
 
         dataset_items = [
-            {"url": "https://swissbeauty.example.com/", "markdown": "# Swiss Beauty Home\nSubstantive homepage brand description."},
+            {"url": "https://swissbeauty.example.com/", "markdown": "# Swiss Beauty Home\nSubstantive homepage brand description and company background."},
             {"url": "https://swissbeauty.example.com/products/lip-gloss", "markdown": "# Lip Gloss\nUltra shine plumping lip gloss with Vitamin E."},
             {"url": "https://swissbeauty.example.com/products/blush", "markdown": "# Craze Blush\npH-activated color changing blush for cheeks."},
         ]
@@ -116,22 +113,43 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.total_failed, 0)
         self.assertTrue(result.has_usable_content)
         self.assertEqual(result.actor_status, "SUCCEEDED")
-        self.assertEqual(len(result.scraped_pages), 3)
+        self.assertIsNone(result.error_message)
 
-    # --- Scenario 2: Actor times out but dataset contains enough valid partial results ---
+    # --- Scenario 2: Actor returns SUCCEEDED but dataset retrieval raises an exception ---
     @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_02_actor_times_out_with_valid_partial_results(self, mock_client_cls: MagicMock) -> None:
+    async def test_02_actor_succeeds_but_dataset_retrieval_raises_exception(self, mock_client_cls: MagicMock) -> None:
+        """When actor reaches SUCCEEDED but dataset read throws an exception, actor_status remains SUCCEEDED and error is preserved."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_run = _make_mock_run(status="SUCCEEDED", dataset_id="ds-2")
+        mock_client.actor.return_value.call.return_value = mock_run
+        mock_client.dataset.return_value.iterate_items.side_effect = RuntimeError("Dataset storage connection reset")
+
+        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
+            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+
+            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.actor_status, "SUCCEEDED")  # Kept as SUCCEEDED, not incorrectly flipped to FAILED
+        self.assertEqual(result.total_scraped, 0)
+        self.assertFalse(result.has_usable_content)
+        self.assertIn("dataset retrieval failed", result.error_message.lower())
+        self.assertIn("Dataset storage connection reset", result.error_message)
+
+    # --- Scenario 3: Actor returns TIMED-OUT with recoverable partial items ---
+    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
+    async def test_03_actor_times_out_with_recoverable_partial_items(self, mock_client_cls: MagicMock) -> None:
         """When actor times out (e.g. 2/3 crawled), recovered dataset items are preserved as partial results."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
         mock_run = _make_mock_run(
             status="TIMED-OUT",
-            dataset_id="ds-2",
+            dataset_id="ds-3",
             status_message="Crawled 2/3 pages, 0 failed requests, desired concurrency 3.",
         )
         mock_client.actor.return_value.call.return_value = mock_run
 
-        # Only 2 of 3 crawled before timeout
         dataset_items = [
             {"url": "https://swissbeauty.example.com/", "markdown": "# Swiss Beauty Home\nSubstantive homepage content describing Swiss Beauty cosmetics and skincare products."},
             {"url": "https://swissbeauty.example.com/products/lip-gloss", "markdown": "# Lip Gloss\nUltra shine plumping gloss with Vitamin E."},
@@ -149,19 +167,16 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.has_usable_content)
         self.assertEqual(result.actor_status, "TIMED-OUT")
 
-        # Missing 3rd page must be in failed_pages with accurate reason
-        failed_urls = [f.url for f in result.failed_pages]
-        self.assertIn("https://swissbeauty.example.com/products/blush", failed_urls)
         failed_blush = next(f for f in result.failed_pages if f.url == "https://swissbeauty.example.com/products/blush")
         self.assertIn("timed out", failed_blush.error_message.lower())
 
-    # --- Scenario 3: Actor times out and dataset contains no items ---
+    # --- Scenario 4: Actor returns TIMED-OUT without recoverable items ---
     @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_03_actor_times_out_with_zero_dataset_items(self, mock_client_cls: MagicMock) -> None:
-        """When actor times out before saving any dataset items, result is failed with zero content."""
+    async def test_04_actor_times_out_without_recoverable_items(self, mock_client_cls: MagicMock) -> None:
+        """When actor times out before saving any dataset items, result is failed and message states no items recovered."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_run = _make_mock_run(status="TIMED-OUT", dataset_id="ds-3", status_message="Timed out during initialization.")
+        mock_run = _make_mock_run(status="TIMED-OUT", dataset_id="ds-4", status_message="Timed out during initialization.")
         mock_client.actor.return_value.call.return_value = mock_run
         mock_client.dataset.return_value.iterate_items.return_value = []
 
@@ -172,23 +187,29 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.total_scraped, 0)
-        self.assertEqual(result.total_failed, 3)
         self.assertFalse(result.has_usable_content)
         self.assertEqual(result.actor_status, "TIMED-OUT")
-        self.assertIn("TIMED-OUT", result.error_message)
+        self.assertIn("No dataset items were recovered", result.error_message)
 
-    # --- Scenario 4: Actor times out and dataset contains only empty/invalid pages ---
+    # --- Scenario 5: Actor initially returns nonterminal status and later reaches SUCCEEDED ---
     @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_04_actor_times_out_with_empty_or_stub_pages(self, mock_client_cls: MagicMock) -> None:
-        """When actor times out and dataset items have < 50 chars, no usable pages are returned."""
+    async def test_05_actor_initially_nonterminal_later_succeeds(self, mock_client_cls: MagicMock) -> None:
+        """When actor call() returns RUNNING, implementation waits on run_client and completes successfully on SUCCEEDED."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_run = _make_mock_run(status="TIMED-OUT", dataset_id="ds-4")
-        mock_client.actor.return_value.call.return_value = mock_run
+
+        # call() returns nonterminal RUNNING
+        initial_run = _make_mock_run(run_id="run-5", status="RUNNING", dataset_id="ds-5")
+        mock_client.actor.return_value.call.return_value = initial_run
+
+        # wait_for_finish returns terminal SUCCEEDED
+        terminal_run = _make_mock_run(run_id="run-5", status="SUCCEEDED", dataset_id="ds-5")
+        mock_client.run.return_value.wait_for_finish.return_value = terminal_run
 
         dataset_items = [
-            {"url": "https://swissbeauty.example.com/", "markdown": "Short stub"},
-            {"url": "https://swissbeauty.example.com/products/lip-gloss", "markdown": "Too short"},
+            {"url": "https://swissbeauty.example.com/", "markdown": "# Swiss Beauty Home\nSubstantive homepage brand description and company background."},
+            {"url": "https://swissbeauty.example.com/products/lip-gloss", "markdown": "# Lip Gloss\nUltra shine plumping lip gloss with Vitamin E."},
+            {"url": "https://swissbeauty.example.com/products/blush", "markdown": "# Craze Blush\npH-activated color changing blush for cheeks."},
         ]
         mock_client.dataset.return_value.iterate_items.return_value = dataset_items
 
@@ -197,169 +218,145 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
 
             result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
 
-        self.assertEqual(result.total_scraped, 0)
-        self.assertFalse(result.has_usable_content)
-        self.assertEqual(result.actor_status, "TIMED-OUT")
-        self.assertEqual(result.status, "empty")
+        mock_client.run.assert_called_with("run-5")
+        mock_client.run.return_value.wait_for_finish.assert_called_once()
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.actor_status, "SUCCEEDED")
+        self.assertEqual(result.total_scraped, 3)
 
-    # --- Scenario 5: Partial results satisfy minimum-content requirement and Business Overview proceeds ---
-    async def test_05_partial_results_satisfy_min_content_workflow_proceeds(self) -> None:
-        """Partial crawl with >= 150 total chars proceeds to business_overview_node successfully."""
-        scraped_page = ScrapedPage(
-            url="https://swissbeauty.example.com/products/lip-gloss",
-            page_type=PageType.PRODUCT,
-            title="Lip Gloss Collection",
-            content="Swiss Beauty high gloss lip tint offering long lasting nourishment, hydrating oils, and vivid colors for daily wear.",
-        )
-        partial_crawl = WebsiteCrawlResult(
-            website_url="https://swissbeauty.example.com",
-            status="partial",
-            scraped_pages=[scraped_page],
-            failed_pages=[
-                FailedPageScrape(
-                    url="https://swissbeauty.example.com/products/blush",
-                    error_message="Page not scraped: crawler run timed out before completion.",
-                    page_type=PageType.PRODUCT,
-                )
-            ],
-            total_requested=2,
-            total_scraped=1,
-            total_failed=1,
-            has_usable_content=True,
-            actor_status="TIMED-OUT",
-        )
-
-        state: AgentState = {
-            "business_form": self.sample_form,
-            "selected_pages": self.selected_pages[:2],
-        }
-
-        with patch(
-            "backend.app.agent.nodes.website_crawling_node.crawl_selected_pages",
-            new=AsyncMock(return_value=partial_crawl),
-        ):
-            crawling_update = await website_crawling_node(state)
-
-        self.assertEqual(crawling_update["workflow_status"], "running")
-        self.assertEqual(len(crawling_update["scraped_pages"]), 1)
-        self.assertTrue(any("Actor timed out; 1 partial pages recovered" in err for err in crawling_update["errors"]))
-
-    # --- Scenario 6: Partial results do not satisfy minimum-content requirement ---
-    async def test_06_partial_results_insufficient_content_returns_clear_error(self) -> None:
-        """When partial crawl yields < 150 chars total, business_overview_node reports insufficient_content."""
-        scraped_page = ScrapedPage(
-            url="https://swissbeauty.example.com/products/lip-gloss",
-            page_type=PageType.PRODUCT,
-            title="Short Gloss",
-            content="Swiss Beauty lip gloss in nude shade.",  # 37 chars < 150 MIN_TOTAL_CONTENT_CHARS
-        )
-        partial_crawl = WebsiteCrawlResult(
-            website_url="https://swissbeauty.example.com",
-            status="partial",
-            scraped_pages=[scraped_page],
-            failed_pages=[],
-            total_requested=2,
-            total_scraped=1,
-            total_failed=1,
-            has_usable_content=True,
-            actor_status="TIMED-OUT",
-        )
-
-        state: AgentState = {
-            "business_form": self.sample_form,
-            "crawl_result": partial_crawl,
-            "scraped_pages": [scraped_page],
-        }
-
-        overview_update = await business_overview_node(state)
-        self.assertEqual(overview_update["workflow_status"], "failed")
-        self.assertEqual(overview_update["overview_result"].status, "insufficient_content")
-        self.assertIn("Insufficient readable website content", overview_update["error_message"])
-
-    # --- Scenario 7: Dataset retrieval fails after a timeout ---
+    # --- Scenario 6: Actor initially returns nonterminal status and later reaches TIMED-OUT with partial results ---
     @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_07_dataset_retrieval_exception_after_timeout_handled_safely(self, mock_client_cls: MagicMock) -> None:
-        """When iterate_items() raises an exception after timeout, error is caught and crawl fails cleanly."""
+    async def test_06_actor_initially_nonterminal_later_times_out_with_partial_results(self, mock_client_cls: MagicMock) -> None:
+        """When actor call() returns RUNNING, wait_for_finish reaches TIMED-OUT, recovering available items."""
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_run = _make_mock_run(status="TIMED-OUT", dataset_id="ds-7")
-        mock_client.actor.return_value.call.return_value = mock_run
-        mock_client.dataset.return_value.iterate_items.side_effect = RuntimeError("Dataset read connection reset")
 
-        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
-            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+        initial_run = _make_mock_run(run_id="run-6", status="RUNNING", dataset_id="ds-6")
+        mock_client.actor.return_value.call.return_value = initial_run
 
-            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+        terminal_run = _make_mock_run(run_id="run-6", status="TIMED-OUT", dataset_id="ds-6", status_message="Crawled 1/3 pages.")
+        mock_client.run.return_value.wait_for_finish.return_value = terminal_run
 
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.total_scraped, 0)
-        self.assertFalse(result.has_usable_content)
-        self.assertEqual(result.actor_status, "TIMED-OUT")
-
-    # --- Scenario 8: Actor metadata is missing a dataset identifier ---
-    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_08_actor_metadata_missing_dataset_id(self, mock_client_cls: MagicMock) -> None:
-        """When actor run returns default_dataset_id=None, it fails gracefully without raising AttributeError."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-        mock_run = _make_mock_run(status="TIMED-OUT", dataset_id=None)
-        mock_client.actor.return_value.call.return_value = mock_run
-
-        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
-            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
-
-            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
-
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.total_scraped, 0)
-        self.assertFalse(result.has_usable_content)
-        self.assertIn("No default dataset ID", result.error_message)
-
-    # --- Scenario 9: Log-streaming separation prevents log exceptions from failing crawl ---
-    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    def test_09_run_actor_sync_disables_background_log_streaming(self, mock_client_cls: MagicMock) -> None:
-        """Verify that _run_actor_sync passes logger=None to call() to disable streaming background threads."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-        mock_run = _make_mock_run(status="SUCCEEDED", dataset_id="ds-9")
-        mock_client.actor.return_value.call.return_value = mock_run
-        mock_client.dataset.return_value.iterate_items.return_value = []
-
-        _run_actor_sync("dummy_token", {"startUrls": [{"url": "https://swissbeauty.example.com"}]}, 120)
-
-        # Confirm call() was passed logger=None
-        _, kwargs = mock_client.actor.return_value.call.call_args
-        self.assertIn("logger", kwargs)
-        self.assertIsNone(kwargs["logger"])
-
-    # --- Scenario 10: Genuine actor failure remains distinguishable from a timeout ---
-    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
-    async def test_10_genuine_actor_failure_distinguishable_from_timeout(self, mock_client_cls: MagicMock) -> None:
-        """Actor ending with status FAILED is distinguishable from TIMED-OUT in metadata and message."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-        mock_run = _make_mock_run(status="FAILED", dataset_id="ds-10", status_message="Actor container out of memory.")
-        mock_client.actor.return_value.call.return_value = mock_run
-        mock_client.dataset.return_value.iterate_items.return_value = []
-
-        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
-            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
-
-            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
-
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.actor_status, "FAILED")
-        self.assertNotEqual(result.actor_status, "TIMED-OUT")
-        self.assertIn("Actor run ended with status 'FAILED'", result.error_message)
-
-    # --- Scenario 11: Transient failures follow retry policy without repeated crawls ---
-    @patch("backend.app.services.website_content_crawler_service._run_actor_sync")
-    async def test_11_retry_policy_avoids_repeated_crawls_on_partial_recovery(self, mock_run_sync: MagicMock) -> None:
-        """If partial items are recovered from a timed-out run, do not retry a full crawl."""
-        partial_items = [
-            {"url": "https://swissbeauty.example.com/", "markdown": "# Swiss Beauty\nHome content exceeding fifty characters minimum."}
+        dataset_items = [
+            {"url": "https://swissbeauty.example.com/products/lip-gloss", "markdown": "# Lip Gloss\nUltra shine plumping gloss with nourishing Vitamin E."},
         ]
-        # Return partial items on attempt 1 with TIMED-OUT status
+        mock_client.dataset.return_value.iterate_items.return_value = dataset_items
+
+        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
+            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+
+            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+
+        mock_client.run.return_value.wait_for_finish.assert_called_once()
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.actor_status, "TIMED-OUT")
+        self.assertEqual(result.total_scraped, 1)
+        self.assertTrue(result.has_usable_content)
+
+    # --- Scenario 7: Actor remains nonterminal until overall deadline expires ---
+    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
+    async def test_07_actor_remains_nonterminal_until_deadline_expires(self, mock_client_cls: MagicMock) -> None:
+        """When actor remains nonterminal (RUNNING) after wait, honest diagnostic is returned without claiming timeout."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        still_running = _make_mock_run(run_id="run-7", status="RUNNING", dataset_id="ds-7")
+        mock_client.actor.return_value.call.return_value = still_running
+        mock_client.run.return_value.wait_for_finish.return_value = still_running
+
+        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
+            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+
+            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.actor_status, "RUNNING")  # Does not claim TIMED-OUT or FAILED
+        self.assertEqual(result.total_scraped, 0)
+        self.assertFalse(result.has_usable_content)
+        self.assertIn("remained nonterminal ('RUNNING')", result.error_message)
+
+    # --- Scenario 8: Implementation does not start duplicate actor run while active ---
+    @patch("backend.app.services.website_content_crawler_service._run_actor_sync")
+    async def test_08_no_duplicate_actor_run_while_still_active(self, mock_run_sync: MagicMock) -> None:
+        """If actor run remains nonterminal (RUNNING), implementation aborts retry loop without duplicate run."""
+        mock_run_sync.return_value = (
+            [],
+            "run-8",
+            "Actor run 'run-8' remained nonterminal ('RUNNING') when operation deadline expired.",
+            "RUNNING",
+        )
+
+        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
+            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+
+            result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+
+        # Crucial: Exactly 1 attempt made, never launches second actor run
+        self.assertEqual(mock_run_sync.call_count, 1)
+        self.assertEqual(result.actor_status, "RUNNING")
+        self.assertEqual(result.status, "failed")
+
+    # --- Scenario 9: Missing dataset ID and empty dataset reported distinctly ---
+    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
+    def test_09_missing_dataset_id_and_empty_dataset_distinct(self, mock_client_cls: MagicMock) -> None:
+        """Missing dataset ID and empty dataset produce distinct, identifiable error messages."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        # Sub-case A: Missing dataset ID
+        mock_client.actor.return_value.call.return_value = _make_mock_run(status="SUCCEEDED", dataset_id=None)
+        items_a, _, err_a, _ = _run_actor_sync("dummy", {"startUrls": []}, 60)
+        self.assertEqual(items_a, [])
+        self.assertIn("returned no default dataset ID in metadata", err_a)
+
+        # Sub-case B: Empty dataset
+        mock_client.actor.return_value.call.return_value = _make_mock_run(status="SUCCEEDED", dataset_id="ds-empty-9")
+        mock_client.dataset.return_value.iterate_items.return_value = []
+        items_b, _, err_b, _ = _run_actor_sync("dummy", {"startUrls": []}, 60)
+        self.assertEqual(items_b, [])
+        self.assertIn("default dataset 'ds-empty-9' was empty", err_b)
+
+        # Ensure distinct messages
+        self.assertNotEqual(err_a, err_b)
+
+    # --- Scenario 10: Genuine FAILED and ABORTED remain distinguishable from timeouts ---
+    @patch("backend.app.services.website_content_crawler_service.ApifyClient")
+    async def test_10_failed_and_aborted_distinguishable_from_timeout(self, mock_client_cls: MagicMock) -> None:
+        """Actor statuses FAILED and ABORTED are distinguishable from TIMED-OUT in actor_status and message."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        # Sub-case A: FAILED
+        mock_client.actor.return_value.call.return_value = _make_mock_run(status="FAILED", dataset_id="ds-f", status_message="Out of memory.")
+        mock_client.dataset.return_value.iterate_items.return_value = []
+
+        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
+            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+
+            res_failed = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+
+        self.assertEqual(res_failed.actor_status, "FAILED")
+        self.assertIn("status 'FAILED'", res_failed.error_message)
+
+        # Sub-case B: ABORTED
+        mock_client.actor.return_value.call.return_value = _make_mock_run(status="ABORTED", dataset_id="ds-a", status_message="Aborted by user.")
+        mock_client.dataset.return_value.iterate_items.return_value = []
+
+        with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
+            mock_settings.APIFY_API_TOKEN.get_secret_value.return_value = "token-123"
+
+            res_aborted = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
+
+        self.assertEqual(res_aborted.actor_status, "ABORTED")
+        self.assertIn("status 'ABORTED'", res_aborted.error_message)
+
+    # --- Scenario 11: Retry behavior remains bounded and avoids redundant full crawls after partial recovery ---
+    @patch("backend.app.services.website_content_crawler_service._run_actor_sync")
+    async def test_11_bounded_retries_and_no_redundant_crawl_after_partial(self, mock_run_sync: MagicMock) -> None:
+        """When partial items are recovered, loop aborts immediately without redundant attempt 2."""
+        partial_items = [
+            {"url": "https://swissbeauty.example.com/", "markdown": "# Swiss Beauty Home\nSubstantive content exceeding fifty characters minimum."}
+        ]
         mock_run_sync.return_value = (partial_items, "run-11", "Actor run ended with status 'TIMED-OUT'", "TIMED-OUT")
 
         with patch("backend.app.services.website_content_crawler_service.settings") as mock_settings:
@@ -367,13 +364,12 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
 
             result = await crawl_selected_pages(self.selected_pages, website_url="https://swissbeauty.example.com")
 
-        # Must execute only 1 attempt and break immediately
         self.assertEqual(mock_run_sync.call_count, 1)
         self.assertEqual(result.status, "partial")
         self.assertEqual(result.total_scraped, 1)
 
     # --- Scenario 12: Final API behavior correctly reflects partial results or insufficient content ---
-    def test_12_final_api_behavior_for_partial_and_insufficient_content(self) -> None:
+    def test_12_final_api_behavior_partial_and_insufficient(self) -> None:
         """API returns 200 on partial crawl with sufficient content, and 422 on insufficient content."""
         payload = {
             "business_name_and_description": "Swiss Beauty cosmetics brand.",

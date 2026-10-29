@@ -180,6 +180,11 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
                 f"Website crawling timed out and yielded 0 usable pages for '{clean_url}': "
                 f"{crawl_result.error_message or 'Actor timed out before returning any readable content.'}"
             )
+        elif getattr(crawl_result, "actor_status", None) in ("READY", "RUNNING", "TIMING-OUT", "ABORTING"):
+            error_msg = (
+                f"Website crawling remained nonterminal ('{crawl_result.actor_status}') for '{clean_url}': "
+                f"{crawl_result.error_message}"
+            )
         else:
             error_msg = (
                 f"Website crawling yielded 0 usable pages for '{clean_url}': "
