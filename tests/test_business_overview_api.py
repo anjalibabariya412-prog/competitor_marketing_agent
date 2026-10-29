@@ -59,6 +59,40 @@ class TestBusinessOverviewAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
+    def test_cors_preflight_options_succeeds_for_frontend_origin(self) -> None:
+        """Verify that preflight OPTIONS request returns 200 with CORS headers for Vite origin."""
+        headers = {
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type, accept",
+        }
+        response = self.client.options("/api/v1/business-overview", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost:5173")
+        self.assertIn("POST", response.headers.get("access-control-allow-methods", ""))
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+
+    def test_cors_preflight_options_succeeds_for_127_0_0_1_origin(self) -> None:
+        """Verify that preflight OPTIONS request works for 127.0.0.1:5173 origin."""
+        headers = {
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+        response = self.client.options("/api/v1/business-overview", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "http://127.0.0.1:5173")
+
+    def test_cors_headers_present_on_post_response(self) -> None:
+        """Verify that actual POST responses include CORS headers."""
+        headers = {
+            "Origin": "http://localhost:5173",
+        }
+        # Send an invalid payload to verify CORS header presence without invoking heavy workflow
+        response = self.client.post("/api/v1/business-overview", json={}, headers=headers)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost:5173")
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+
     def test_openapi_schema_contains_business_overview_endpoint(self) -> None:
         """Verify that /api/v1/business-overview is registered in FastAPI OpenAPI docs."""
         response = self.client.get("/openapi.json")
