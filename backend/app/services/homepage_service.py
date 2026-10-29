@@ -220,7 +220,7 @@ def _build_actor_input(url: str) -> dict:
     Configuration choices:
     - ``maxPagesPerCrawl=1`` / ``maxResultsPerCrawl=1``: fetch exactly one page.
     - ``globs=[]`` / ``pseudoUrls=[]`` / ``linkSelector=""``: no link following.
-    - ``waitUntil="networkidle"``: wait for JS-rendered content.
+    - ``waitUntil="domcontentloaded"``: wait for JS-rendered content.
     - ``launcher="chromium"``: default headless browser.
     - ``proxyConfiguration={"useApifyProxy": True}``: required by the Actor.
     - ``maxRequestRetries=0``: we handle retries at the Python layer; Actor
@@ -252,9 +252,9 @@ def _build_actor_input(url: str) -> dict:
         "maxResultsPerCrawl": 1,
         "maxCrawlingDepth": 0,
         "maxConcurrency": 1,
-        "pageLoadTimeoutSecs": 60,
-        "pageFunctionTimeoutSecs": 60,
-        "waitUntil": "networkidle",
+        "pageLoadTimeoutSecs": 30,
+        "pageFunctionTimeoutSecs": 30,
+        "waitUntil": "domcontentloaded",
         "closeCookieModals": False,
         "maxScrollHeightPixels": 0,
         "debugLog": False,

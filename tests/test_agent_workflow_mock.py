@@ -349,10 +349,14 @@ class TestAgentWorkflowMock(unittest.IsolatedAsyncioTestCase):
             )
 
             # --- Assert Mock Call Arguments ---
-            patch_discover.assert_awaited_once_with("https://www.luminabotanicals.com")
+            patch_discover.assert_awaited_once_with(
+                "https://www.luminabotanicals.com",
+                product_or_service=business_form.product_or_service,
+            )
             patch_select.assert_awaited_once_with(
                 candidates=candidate_urls,
                 website_url="https://www.luminabotanicals.com",
+                product_or_service=business_form.product_or_service,
             )
             patch_crawl.assert_awaited_once_with(
                 pages=selected_pages,
@@ -361,6 +365,7 @@ class TestAgentWorkflowMock(unittest.IsolatedAsyncioTestCase):
             patch_overview.assert_awaited_once_with(
                 crawl_input=crawl_result,
                 website_url="https://www.luminabotanicals.com",
+                business_form=business_form,
             )
 
             # --- Assert State Preservation & Propagation ---

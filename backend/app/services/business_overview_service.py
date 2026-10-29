@@ -26,6 +26,10 @@ from typing import Any, Literal, Sequence
 from openai import AsyncOpenAI, OpenAIError
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.app.agent.prompts.business_overview import (
+    BUSINESS_OVERVIEW_SYSTEM_PROMPT,
+    BUSINESS_OVERVIEW_USER_PROMPT_TEMPLATE,
+)
 from backend.app.core.config import settings
 from backend.app.schemas.enums import FindingType, PageType
 from backend.app.schemas.scraped_data import Finding, ScrapedPage
@@ -49,36 +53,6 @@ MIN_TOTAL_CONTENT_CHARS: int = 150
 # Request timeout for OpenAI LLM call
 DEFAULT_LLM_TIMEOUT_SECONDS: float = 60.0
 
-# ---------------------------------------------------------------------------
-# Prompt Definitions
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """\
-You are an expert business intelligence and competitor analysis analyst.
-Your task is to analyze the crawled website content of a business and generate a concise, factual, and strictly evidence-based business overview.
-
-STRICT ACCURACY RULES:
-1. EVIDENCE-BASED ONLY: Use ONLY facts, statements, products, and claims explicitly stated or clearly demonstrated in the provided page excerpts.
-2. NO HALLUCINATION: Never invent business facts, revenue, prices, target audiences, features, partners, or claims that are not in the text.
-3. EXPLICIT VS INFERRED: Distinguish clearly between explicit statements (directly stated on the website) and reasonable interpretations. Set is_explicit=True only when directly stated.
-4. UNKNOWN INFORMATION: If key information (such as pricing, specific customer personas, company history, or contact details) is not mentioned on the provided pages, explicitly record it in `information_gaps`. Do not guess.
-5. FAILED / MISSING PAGES: Do not treat failed or blocked pages as evidence that information does not exist. Only report what could or could not be determined from the available text.
-6. NO RECOMMENDATIONS: Do NOT provide marketing advice, growth strategies, or suggestions. Focus entirely on describing what the business is and does today.
-7. SOURCE TRACEABILITY:
-   - Every product, value proposition, target audience, and key finding MUST cite the EXACT page URL from the provided crawled pages list where the supporting evidence appears.
-   - NEVER cite URLs that are not in the provided crawled pages list (do NOT invent internal paths or cite external websites).
-   - NEVER attribute a claim to the homepage unless the homepage excerpt actually contains evidence for that specific claim.
-   - If a claim or observation cannot be linked to a specific provided page, do NOT invent a URL; set source_url to null.
-"""
-
-_USER_PROMPT_TEMPLATE = """\
-Analyze the following crawled pages for website: {website_url}
-
-=== CRAWLED WEBSITE PAGES ({page_count} pages) ===
-{formatted_pages}
-
-Generate a comprehensive, structured Business Overview conforming strictly to the required schema. Ensure all source URLs match the pages above.
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +199,32 @@ class BusinessOverviewResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Temporary Diagnostic Tracing Helpers (CRAZE Product Data Trace)
+# ---------------------------------------------------------------------------
+
+def _diag_check_craze(text: str | None) -> bool:
+    """Diagnostic helper: check if text contains CRAZE product identifier."""
+    if not text:
+        return False
+    lower = text.lower()
+    return "craze" in lower or "ph-lease" in lower
+
+
+def _diag_check_price_269(text: str | None) -> bool:
+    """Diagnostic helper: check if text contains price 269 or ₹269."""
+    if not text:
+        return False
+    return "269" in text or "\u20b9269" in text or "₹269" in text
+
+
+def _diag_check_price_175(text: str | None) -> bool:
+    """Diagnostic helper: check if text contains coupon price 175 or ₹175."""
+    if not text:
+        return False
+    return "175" in text or "\u20b9175" in text or "₹175" in text
+
+
+# ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
 
@@ -263,8 +263,27 @@ def _format_pages_for_prompt(pages: list[ScrapedPage]) -> str:
     total_chars = 0
     formatted_chunks: list[str] = []
 
+    # [DIAGNOSTIC business_overview_trace] CHECKPOINT 2 tracking
+    included_records: list[dict[str, Any]] = []
+    excluded_records: list[dict[str, Any]] = []
+
     for idx, page in enumerate(pages, start=1):
         if total_chars >= MAX_TOTAL_INPUT_CHARS:
+            p_content = page.content or ""
+            excluded_records.append({
+                "index": idx,
+                "url": page.url,
+                "reason": f"budget_exhausted (total_chars {total_chars} >= MAX_TOTAL_INPUT_CHARS {MAX_TOTAL_INPUT_CHARS})",
+                "has_craze": _diag_check_craze(page.url) or _diag_check_craze(p_content),
+            })
+            for rem_idx, rem_page in enumerate(pages[idx:], start=idx + 1):
+                rem_content = rem_page.content or ""
+                excluded_records.append({
+                    "index": rem_idx,
+                    "url": rem_page.url,
+                    "reason": f"skipped_due_to_earlier_budget_exhaustion (at page {idx})",
+                    "has_craze": _diag_check_craze(rem_page.url) or _diag_check_craze(rem_content),
+                })
             break
 
         title_str = f" | Title: {page.title}" if page.title else ""
@@ -282,14 +301,80 @@ def _format_pages_for_prompt(pages: list[ScrapedPage]) -> str:
         if total_chars + len(chunk) > MAX_TOTAL_INPUT_CHARS:
             allowed_chars = MAX_TOTAL_INPUT_CHARS - total_chars
             if allowed_chars > 200:
-                chunk = chunk[:allowed_chars] + "\n[Remaining content truncated for budget...]\n"
-                formatted_chunks.append(chunk)
+                truncated_chunk = chunk[:allowed_chars] + "\n[Remaining content truncated for budget...]\n"
+                formatted_chunks.append(truncated_chunk)
+                included_records.append({
+                    "index": idx,
+                    "url": page.url,
+                    "included_chars": len(truncated_chunk),
+                    "status": f"partially_included_truncated (allowed_chars={allowed_chars})",
+                    "has_craze": _diag_check_craze(truncated_chunk),
+                    "has_269": _diag_check_price_269(truncated_chunk),
+                    "has_175": _diag_check_price_175(truncated_chunk),
+                })
+            else:
+                p_content = page.content or ""
+                excluded_records.append({
+                    "index": idx,
+                    "url": page.url,
+                    "reason": f"remaining_budget_under_200_chars (allowed_chars={allowed_chars})",
+                    "has_craze": _diag_check_craze(page.url) or _diag_check_craze(p_content),
+                })
+            for rem_idx, rem_page in enumerate(pages[idx:], start=idx + 1):
+                rem_content = rem_page.content or ""
+                excluded_records.append({
+                    "index": rem_idx,
+                    "url": rem_page.url,
+                    "reason": f"skipped_due_to_budget_cutoff (cutoff at page {idx})",
+                    "has_craze": _diag_check_craze(rem_page.url) or _diag_check_craze(rem_content),
+                })
             break
 
         formatted_chunks.append(chunk)
         total_chars += len(chunk)
+        included_records.append({
+            "index": idx,
+            "url": page.url,
+            "included_chars": len(chunk),
+            "status": "fully_included",
+            "has_craze": _diag_check_craze(chunk),
+            "has_269": _diag_check_price_269(chunk),
+            "has_175": _diag_check_price_175(chunk),
+        })
 
-    return "\n".join(formatted_chunks)
+    final_formatted = "\n".join(formatted_chunks)
+
+    # [DIAGNOSTIC business_overview_trace] CHECKPOINT 2 logs
+    logger.info(
+        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars). has_craze=%s, has_269=%s, has_175=%s",
+        len(included_records),
+        len(pages),
+        len(final_formatted),
+        _diag_check_craze(final_formatted),
+        _diag_check_price_269(final_formatted),
+        _diag_check_price_175(final_formatted),
+    )
+    for rec in included_records:
+        logger.info(
+            "[business_overview_trace] [CHECKPOINT 2: format_pages] INCLUDED page %d: url=%s, chars=%d, status=%s, has_craze=%s, has_269=%s, has_175=%s",
+            rec["index"],
+            rec["url"],
+            rec["included_chars"],
+            rec["status"],
+            rec["has_craze"],
+            rec["has_269"],
+            rec["has_175"],
+        )
+    for rec in excluded_records:
+        logger.info(
+            "[business_overview_trace] [CHECKPOINT 2: format_pages] EXCLUDED page %d: url=%s, reason=%s, has_craze=%s",
+            rec["index"],
+            rec["url"],
+            rec["reason"],
+            rec["has_craze"],
+        )
+
+    return final_formatted
 
 
 def _normalize_url_for_comparison(url: str) -> str:
@@ -325,11 +410,23 @@ def _resolve_and_verify_source_url(
     Returns the exact original crawled URL if matched, or None if the URL was not
     crawled, is external, or is invalid. NEVER falls back to the homepage.
     """
+    is_craze_url = _diag_check_craze(raw_url)
+
     if not raw_url or not isinstance(raw_url, str):
+        if is_craze_url:
+            logger.warning(
+                "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' REJECTED: reason=null_or_not_string",
+                raw_url,
+            )
         return None
 
     cleaned = raw_url.strip()
     if not cleaned:
+        if is_craze_url:
+            logger.warning(
+                "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' REJECTED: reason=empty_after_strip",
+                raw_url,
+            )
         return None
 
     # If relative path cited (e.g. '/pricing' or 'about'), resolve against base website URL
@@ -340,6 +437,12 @@ def _resolve_and_verify_source_url(
 
     # Must use http or https
     if parsed.scheme.lower() not in ("http", "https"):
+        if is_craze_url:
+            logger.warning(
+                "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' REJECTED: reason=invalid_scheme (%s)",
+                raw_url,
+                parsed.scheme,
+            )
         return None
 
     # Reject external domains not matching crawled website host
@@ -357,21 +460,48 @@ def _resolve_and_verify_source_url(
         and not base_host.endswith("." + cited_host)
     ):
         logger.debug("Rejecting external source URL '%s' (base host: %s).", cleaned, base_host)
+        if is_craze_url:
+            logger.warning(
+                "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' REJECTED: reason=external_domain (cited_host=%s, base_host=%s)",
+                raw_url,
+                cited_host,
+                base_host,
+            )
         return None
 
     norm = _normalize_url_for_comparison(cleaned)
     if norm in norm_to_original:
-        return norm_to_original[norm]
+        matched = norm_to_original[norm]
+        if is_craze_url:
+            logger.info(
+                "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' ACCEPTED -> matched crawled URL '%s'",
+                raw_url,
+                matched,
+            )
+        return matched
 
     # Also check path-only comparison without query
     norm_no_query = _normalize_url_for_comparison(
         urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
     )
     if norm_no_query in norm_to_original:
-        return norm_to_original[norm_no_query]
+        matched = norm_to_original[norm_no_query]
+        if is_craze_url:
+            logger.info(
+                "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' ACCEPTED (path-only) -> matched crawled URL '%s'",
+                raw_url,
+                matched,
+            )
+        return matched
 
     # Un-crawled fabricated path or unmatched internal URL -> reject!
     logger.debug("Rejecting un-crawled internal source URL '%s'.", cleaned)
+    if is_craze_url:
+        logger.warning(
+            "[business_overview_trace] [CHECKPOINT 5: source_url_verification] CRAZE source URL '%s' REJECTED: reason=uncrawled_or_unmatched_url (norm='%s')",
+            raw_url,
+            norm,
+        )
     return None
 
 
@@ -380,6 +510,7 @@ def _sanitize_and_validate_overview(
     valid_source_urls: Sequence[str] | set[str] | Sequence[ScrapedPage],
     base_website_url: str | None = None,
     fallback_website_url: str | None = None,
+    business_form: Any = None,
 ) -> BusinessOverview:
     """Verify and normalize source URLs against the actual crawled pages.
 
@@ -395,6 +526,23 @@ def _sanitize_and_validate_overview(
     resolved_base = base_website_url or fallback_website_url or overview.website_url or "https://unknown.com"
     if not overview.website_url:
         overview.website_url = resolved_base
+
+    # [DIAGNOSTIC business_overview_trace] CHECKPOINT 5: Pre-sanitization state
+    craze_in_raw_json = _diag_check_craze(overview.model_dump_json())
+    craze_products_pre = [
+        (p.name, p.source_url) for p in overview.products_and_services
+        if _diag_check_craze(p.name) or _diag_check_craze(p.source_url)
+    ]
+    craze_findings_pre = [
+        (f.statement[:60], f.source_url) for f in overview.key_findings
+        if _diag_check_craze(f.statement) or _diag_check_craze(f.source_url)
+    ]
+    logger.info(
+        "[business_overview_trace] [CHECKPOINT 5: sanitization] Starting sanitization. CRAZE in raw overview: %s, products: %s, findings: %d",
+        craze_in_raw_json,
+        craze_products_pre,
+        len(craze_findings_pre),
+    )
 
     # Build canonical lookup table from crawled pages
     norm_to_original: dict[str, str] = {}
@@ -445,6 +593,12 @@ def _sanitize_and_validate_overview(
             finding.source_url = verified_source
             verified_findings.append(finding)
         else:
+            if _diag_check_craze(finding.statement) or _diag_check_craze(finding.source_url):
+                logger.warning(
+                    "[business_overview_trace] [CHECKPOINT 5: finding_dropped] CRAZE finding dropped! statement='%s', source_url='%s'",
+                    finding.statement[:60],
+                    finding.source_url,
+                )
             logger.warning(
                 "Dropping unsupported finding '%s' citing un-crawled source: %s",
                 finding.statement[:60],
@@ -467,6 +621,52 @@ def _sanitize_and_validate_overview(
         verified_sources.add(overview.target_audience.source_url)
 
     overview.sources_used = sorted(list(verified_sources))
+
+    # 6. Harmonize with user-provided intake data
+    if business_form is not None:
+        stated_name_desc = ""
+        stated_audience = ""
+        audience_unknown = False
+
+        if hasattr(business_form, "business_name_and_description"):
+            stated_name_desc = business_form.business_name_and_description
+            stated_audience = business_form.target_audience or ""
+            audience_unknown = business_form.audience_unknown
+        elif isinstance(business_form, dict):
+            stated_name_desc = business_form.get("business_name_and_description", "")
+            stated_audience = business_form.get("target_audience", "") or ""
+            audience_unknown = bool(business_form.get("audience_unknown", False))
+
+        # Preserve user-provided target audience if provided and not explicitly specified as unknown
+        if stated_audience and not audience_unknown:
+            if not overview.target_audience.description or "not specified" in overview.target_audience.description.lower():
+                overview.target_audience.description = stated_audience
+            overview.target_audience.is_explicit = True
+
+        # Preserve business description from intake if overview is empty
+        if not overview.business_description or overview.business_description.strip() in ("", "unknown"):
+            overview.business_description = stated_name_desc
+
+    # [DIAGNOSTIC business_overview_trace] CHECKPOINT 5: Post-sanitization state
+    craze_in_sanitized_json = _diag_check_craze(overview.model_dump_json())
+    craze_products_post = [
+        (p.name, p.source_url) for p in overview.products_and_services
+        if _diag_check_craze(p.name) or _diag_check_craze(p.source_url)
+    ]
+    craze_findings_post = [
+        (f.statement[:60], f.source_url) for f in overview.key_findings
+        if _diag_check_craze(f.statement) or _diag_check_craze(f.source_url)
+    ]
+    craze_in_sources_used = any(_diag_check_craze(u) for u in overview.sources_used)
+    logger.info(
+        "[business_overview_trace] [CHECKPOINT 5: sanitization] Completed sanitization. CRAZE in sanitized overview: %s, products: %s, findings: %d. CRAZE in sources_used: %s (total sources: %d)",
+        craze_in_sanitized_json,
+        craze_products_post,
+        len(craze_findings_post),
+        craze_in_sources_used,
+        len(overview.sources_used),
+    )
+
     return overview
 
 
@@ -478,6 +678,7 @@ async def generate_business_overview(
     crawl_input: WebsiteCrawlResult | Sequence[ScrapedPage],
     *,
     website_url: str | None = None,
+    business_form: Any = None,
     model: str | None = None,
     timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
 ) -> BusinessOverviewResult:
@@ -498,6 +699,28 @@ async def generate_business_overview(
     # 1. Extract and validate usable scraped pages
     usable_pages, inferred_url = _extract_usable_pages(crawl_input)
     resolved_website_url = website_url or inferred_url or "https://unknown.com"
+
+    # [DIAGNOSTIC business_overview_trace] CHECKPOINT 1: Immediately after _extract_usable_pages
+    logger.info(
+        "[business_overview_trace] [CHECKPOINT 1: usable_pages] Extracted %d usable pages from crawl input for %s",
+        len(usable_pages),
+        resolved_website_url,
+    )
+    for idx, p in enumerate(usable_pages, start=1):
+        p_content = p.content or ""
+        p_has_craze = _diag_check_craze(p.url) or _diag_check_craze(p_content)
+        p_has_269 = _diag_check_price_269(p_content)
+        p_has_175 = _diag_check_price_175(p_content)
+        logger.info(
+            "[business_overview_trace] [CHECKPOINT 1: usable_pages] Page %d/%d: url=%s, chars=%d, has_craze=%s, has_269=%s, has_175=%s",
+            idx,
+            len(usable_pages),
+            p.url,
+            len(p_content.strip()),
+            p_has_craze,
+            p_has_269,
+            p_has_175,
+        )
 
     # 2. Check for insufficient content
     total_content_length = sum(len(p.content.strip()) for p in usable_pages)
@@ -562,12 +785,58 @@ async def generate_business_overview(
             error_message=err,
         )
 
-    # 5. Build prompt with bounded page excerpts
+    # 5. Build prompt with bounded page excerpts and user intake context
+    stated_name_desc = ""
+    stated_product = ""
+    stated_audience = ""
+    audience_unknown = False
+    stated_social = ""
+
+    if hasattr(business_form, "business_name_and_description"):
+        stated_name_desc = business_form.business_name_and_description
+        stated_product = business_form.product_or_service
+        stated_audience = business_form.target_audience or ""
+        audience_unknown = business_form.audience_unknown
+        stated_social = business_form.social_link or ""
+    elif isinstance(business_form, dict):
+        stated_name_desc = business_form.get("business_name_and_description", "")
+        stated_product = business_form.get("product_or_service", "")
+        stated_audience = business_form.get("target_audience", "") or ""
+        audience_unknown = bool(business_form.get("audience_unknown", False))
+        stated_social = business_form.get("social_link", "") or ""
+
+    intake_parts: list[str] = []
+    if stated_name_desc:
+        intake_parts.append(f"- Stated Business Identity: {stated_name_desc}")
+    if stated_product:
+        intake_parts.append(f"- Primary Product / Service Focus: {stated_product}")
+    if stated_audience:
+        intake_parts.append(f"- Stated Target Audience: {stated_audience}")
+    elif audience_unknown:
+        intake_parts.append("- Stated Target Audience: Not specified by user (audience_unknown=True)")
+    if stated_social:
+        intake_parts.append(f"- Stated Social Link: {stated_social}")
+
+    user_intake_context = "\n".join(intake_parts) if intake_parts else "No user intake provided; derive strictly from crawled content."
+    product_focus = stated_product if stated_product else "Core commercial offerings"
+
     formatted_pages = _format_pages_for_prompt(usable_pages)
-    user_prompt = _USER_PROMPT_TEMPLATE.format(
+    user_prompt = BUSINESS_OVERVIEW_USER_PROMPT_TEMPLATE.format(
         website_url=resolved_website_url,
+        user_intake_context=user_intake_context,
+        product_focus=product_focus,
         page_count=len(usable_pages),
         formatted_pages=formatted_pages,
+    )
+
+    # [DIAGNOSTIC business_overview_trace] CHECKPOINT 3: Immediately before LLM request
+    logger.info(
+        "[business_overview_trace] [CHECKPOINT 3: pre_llm_request] User prompt char length: %d, page sections count: %d. has_craze=%s, has_269=%s, has_175=%s",
+        len(user_prompt),
+        user_prompt.count("--- Page "),
+        _diag_check_craze(user_prompt),
+        _diag_check_price_269(user_prompt),
+        _diag_check_price_175(user_prompt),
     )
 
     # 6. Invoke OpenAI Structured Output
@@ -577,7 +846,7 @@ async def generate_business_overview(
         completion = await client.beta.chat.completions.parse(
             model=resolved_model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": BUSINESS_OVERVIEW_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             response_format=BusinessOverview,
@@ -598,12 +867,49 @@ async def generate_business_overview(
                 error_message=err,
             )
 
+        # [DIAGNOSTIC business_overview_trace] CHECKPOINT 4: Immediately after receiving raw LLM response
+        raw_json = parsed_overview.model_dump_json()
+        all_cited_urls = [
+            p.source_url for p in parsed_overview.products_and_services if p.source_url
+        ] + [
+            vp.source_url for vp in parsed_overview.positioning_and_value_propositions if vp.source_url
+        ] + [
+            f.source_url for f in parsed_overview.key_findings if f.source_url
+        ] + (
+            [parsed_overview.target_audience.source_url]
+            if parsed_overview.target_audience and parsed_overview.target_audience.source_url
+            else []
+        ) + parsed_overview.sources_used
+
+        raw_has_craze = _diag_check_craze(raw_json)
+        raw_has_craze_url = any(_diag_check_craze(u) for u in all_cited_urls)
+        raw_has_269 = _diag_check_price_269(raw_json)
+        raw_has_175 = _diag_check_price_175(raw_json)
+        matching_products = [
+            p.name for p in parsed_overview.products_and_services
+            if _diag_check_craze(p.name) or _diag_check_craze(p.source_url)
+        ]
+        matching_findings_count = len([
+            f for f in parsed_overview.key_findings
+            if _diag_check_craze(f.statement) or _diag_check_craze(f.source_url)
+        ])
+        logger.info(
+            "[business_overview_trace] [CHECKPOINT 4: raw_llm_response] Raw LLM response: has_craze=%s, has_craze_url=%s, has_269=%s, has_175=%s, matching_products=%s, matching_findings_count=%d",
+            raw_has_craze,
+            raw_has_craze_url,
+            raw_has_269,
+            raw_has_175,
+            matching_products,
+            matching_findings_count,
+        )
+
         # 7. Validate and sanitize source URLs against actual crawled pages
         valid_source_urls = {p.url for p in usable_pages}
         sanitized_overview = _sanitize_and_validate_overview(
             parsed_overview,
             valid_source_urls=valid_source_urls,
             fallback_website_url=resolved_website_url,
+            business_form=business_form,
         )
 
         total_findings = len(sanitized_overview.key_findings)

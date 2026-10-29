@@ -144,6 +144,7 @@ async def business_overview_node(state: AgentState) -> dict[str, Any]:
         overview_result = await generate_business_overview(
             crawl_input=crawl_input,
             website_url=clean_url or None,
+            business_form=business_form,
         )
     except Exception as exc:
         logger.exception("Unexpected exception in business overview service for '%s': %s", clean_url, exc)

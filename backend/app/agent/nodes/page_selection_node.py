@@ -125,11 +125,19 @@ async def page_selection_node(state: AgentState) -> dict[str, Any]:
         clean_url,
     )
 
-    # 4. Invoke the existing page selection service
+    # 4. Extract product_or_service from business_form and invoke page selection
+    business_form = state.get("business_form")
+    product_or_service: str | None = None
+    if isinstance(business_form, BusinessForm):
+        product_or_service = business_form.product_or_service
+    elif isinstance(business_form, dict):
+        product_or_service = business_form.get("product_or_service")
+
     try:
         selection_result = await select_pages_with_llm(
             candidates=cleaned_candidates,
             website_url=clean_url,
+            product_or_service=product_or_service,
         )
     except Exception as exc:
         logger.exception("Unexpected exception in page selection service for '%s': %s", clean_url, exc)

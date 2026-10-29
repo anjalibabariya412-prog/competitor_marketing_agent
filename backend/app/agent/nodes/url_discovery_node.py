@@ -57,14 +57,17 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
             "errors": [error_msg],
         }
 
-    # 2. Extract business_website from business_form
+    # 2. Extract business_website and product_or_service from business_form
     business_form = state.get("business_form")
     website_url: str | None = None
+    product_or_service: str | None = None
 
     if isinstance(business_form, BusinessForm):
         website_url = business_form.business_website
+        product_or_service = business_form.product_or_service
     elif isinstance(business_form, dict):
         website_url = business_form.get("business_website")
+        product_or_service = business_form.get("product_or_service")
 
     if not website_url or not isinstance(website_url, str) or not website_url.strip():
         error_msg = (
@@ -96,7 +99,7 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
 
     # 3. Call existing URL discovery orchestrator
     try:
-        discovery_result = await discover_website_urls(clean_url)
+        discovery_result = await discover_website_urls(clean_url, product_or_service=product_or_service)
     except Exception as exc:
         logger.exception("Unexpected exception during URL discovery for '%s': %s", clean_url, exc)
         error_msg = f"URL discovery failed unexpectedly for '{clean_url}': {exc}"

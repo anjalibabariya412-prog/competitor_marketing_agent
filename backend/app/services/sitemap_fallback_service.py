@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import Literal
@@ -336,9 +337,45 @@ def _get_common_sitemap_probe_urls(base_url: str) -> list[str]:
 # Core Sitemap Discovery Service
 # ---------------------------------------------------------------------------
 
+
+_COMMON_STOP_WORDS: frozenset[str] = frozenset({
+    "our", "my", "we", "us", "the", "a", "an", "and", "or", "of", "for",
+    "in", "to", "with", "is", "at", "by", "from", "on", "all", "your",
+    "their", "this", "that", "it", "its", "as", "be", "are",
+})
+
+
+def extract_product_keywords(product_or_service: str | None) -> list[str]:
+    """Extract normalized keyword tokens from user-submitted product or service text."""
+    if not product_or_service or not product_or_service.strip():
+        return []
+    cleaned = re.sub(r"[^\w\s-]", " ", product_or_service.lower())
+    tokens = re.split(r"[-\s_]+", cleaned)
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        tok = tok.strip()
+        if len(tok) >= 2 and tok not in _COMMON_STOP_WORDS:
+            if tok not in seen:
+                seen.add(tok)
+                keywords.append(tok)
+            # Add singularized form if plural
+            if tok.endswith("es") and len(tok) > 4:
+                sing = tok[:-2]
+                if sing not in seen and len(sing) >= 3:
+                    seen.add(sing)
+                    keywords.append(sing)
+            elif tok.endswith("s") and len(tok) > 3:
+                sing = tok[:-1]
+                if sing not in seen and len(sing) >= 3:
+                    seen.add(sing)
+                    keywords.append(sing)
+    return keywords
+
 async def discover_sitemap_urls(
     website_url: str,
     *,
+    product_or_service: str | None = None,
     timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     max_files: int = MAX_SITEMAP_FILES,
     max_depth: int = MAX_SITEMAP_DEPTH,
@@ -432,9 +469,23 @@ async def discover_sitemap_urls(
 
                 sub_sitemaps, raw_page_urls = _extract_sitemap_elements(root)
 
-                # Queue nested sitemaps within depth bounds
+                # Queue nested sitemaps within depth bounds, prioritizing product/category sitemaps
                 if depth < max_depth:
-                    for sub in sub_sitemaps:
+                    keywords = extract_product_keywords(product_or_service)
+                    def _sitemap_prio(s_url: str) -> int:
+                        s_low = s_url.lower()
+                        if any(kw in s_low for kw in keywords):
+                            return 100
+                        if any(c in s_low for c in ("collection", "category", "catalog")):
+                            return 80
+                        if "page" in s_low:
+                            return 60
+                        if "product" in s_low:
+                            return 40
+                        return 20
+
+                    sorted_subs = sorted(sub_sitemaps, key=_sitemap_prio, reverse=True)
+                    for sub in sorted_subs:
                         sub_key = sub.lower().rstrip("/")
                         if sub_key not in seen_sitemaps:
                             sitemaps_to_explore.append((sub, depth + 1))
@@ -555,6 +606,7 @@ def merge_candidate_urls(
 async def discover_website_urls(
     website_url: str,
     *,
+    product_or_service: str | None = None,
     homepage_fetch_result: HomepageFetchResult | None = None,
     min_priority_links: int = 5,
     force_sitemap: bool = False,
@@ -621,7 +673,7 @@ async def discover_website_urls(
             resolved_base,
             trigger_reason,
         )
-        sitemap_res = await discover_sitemap_urls(resolved_base)
+        sitemap_res = await discover_sitemap_urls(resolved_base, product_or_service=product_or_service)
         sitemap_status = sitemap_res.status
         sitemap_candidates = sitemap_res.candidate_urls
     else:
@@ -633,6 +685,31 @@ async def discover_website_urls(
         sitemap_candidates,
         base_url=resolved_base,
     )
+
+    # Elevate product-matching candidates when product_or_service is specified
+    if product_or_service and product_or_service.strip():
+        keywords = extract_product_keywords(product_or_service)
+        phrase = product_or_service.lower().strip()
+        slug_phrase = re.sub(r"\s+", "-", phrase)
+
+        def _candidate_rank(c: CandidateURL) -> tuple[int, int, str]:
+            u_low = c.url.lower()
+            t_low = (c.link_text or "").lower()
+            score = 0
+            if phrase in t_low or slug_phrase in u_low or phrase in u_low:
+                score += 150
+            matches = sum(1 for kw in keywords if kw in u_low or kw in t_low)
+            if matches > 0:
+                score += 40 + matches * 20
+            if c.page_type == PageType.HOME:
+                score += 50
+            elif c.page_type in (PageType.ABOUT, PageType.PRICING, PageType.OFFER):
+                score += 30
+            path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
+            return (score, -path_segments, c.url)
+
+        combined_candidates = sorted(combined_candidates, key=_candidate_rank, reverse=True)
+
     total_candidates = len(combined_candidates)
 
     # 6. Assess category coverage

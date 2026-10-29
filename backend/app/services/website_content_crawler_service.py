@@ -288,6 +288,7 @@ def _build_actor_input(
         # Depth 0 guarantees only startUrls are scraped; no child links are followed.
         "maxCrawlDepth": 0,
         "maxCrawlPages": len(urls),
+        "maxConcurrency": min(len(urls), 4),
         "crawlerType": "playwright:adaptive",
         "saveMarkdown": True,
         "saveHtml": False,
@@ -574,9 +575,10 @@ async def crawl_selected_pages(
         if last_error is None:
             break
 
-        # Permanent errors should not be retried
-        if "401" in last_error or "403" in last_error or "404" in last_error:
-            logger.warning("Permanent error encountered from Apify: %s; aborting retries.", last_error)
+        # Permanent errors or timeout failures should not be retried blindly
+        lower_err = last_error.lower()
+        if "401" in last_error or "403" in last_error or "404" in last_error or "timed-out" in lower_err or "timeout" in lower_err:
+            logger.warning("Non-retryable or timeout error encountered from Apify: %s; aborting retries.", last_error)
             break
 
         if attempt < MAX_TRANSIENT_RETRIES:

@@ -27,7 +27,13 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from backend.app.core.config import settings
+import re
+from backend.app.agent.prompts import (
+    PAGE_SELECTION_SYSTEM_PROMPT,
+    PAGE_SELECTION_USER_PROMPT_TEMPLATE,
+)
 from backend.app.schemas.enums import PageType
+from .sitemap_fallback_service import extract_product_keywords
 from .sitemap_fallback_service import WebsiteURLDiscoveryResult, discover_website_urls
 from .url_extractor_service import CandidateURL
 
@@ -154,11 +160,53 @@ class WebsitePipelineResult(BaseModel):
 # Deterministic Fallback Implementation
 # ---------------------------------------------------------------------------
 
+
+def calculate_product_relevance(
+    candidate: CandidateURL,
+    keywords: list[str],
+    full_phrase: str = "",
+) -> int:
+    """Calculate a relevance score for a candidate URL against the user's product/service.
+
+    Gives strong priority to exact phrase matches and token matches in URL path or link text,
+    plus collection/category page boosts for relevant product areas.
+    """
+    if not keywords and not full_phrase:
+        return 0
+
+    norm_url = candidate.url.lower()
+    norm_text = (candidate.link_text or "").lower()
+    score = 0
+
+    # 1. Exact phrase match (e.g. "lip gloss" or "lip-gloss")
+    if full_phrase:
+        clean_phrase = full_phrase.lower().strip()
+        slug_phrase = re.sub(r"\s+", "-", clean_phrase)
+        if clean_phrase in norm_text or slug_phrase in norm_url or clean_phrase in norm_url:
+            score += 150
+
+    # 2. Token matches
+    matching_tokens = sum(1 for kw in keywords if kw in norm_url or kw in norm_text)
+    if matching_tokens > 0:
+        score += matching_tokens * 35
+        if matching_tokens == len(keywords) and len(keywords) > 1:
+            score += 60
+
+    # 3. Collection / category boost when matching
+    if score > 0:
+        if any(cat in norm_url for cat in ("/collection", "/collections", "/category", "/categories")):
+            score += 50
+        elif candidate.page_type in (PageType.PRODUCT, PageType.SERVICE):
+            score += 30
+
+    return score
+
 def select_pages_deterministic(
     candidates: list[CandidateURL],
     *,
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     base_url: str = "",
+    product_or_service: str | None = None,
 ) -> PageSelectionResult:
     """Deterministically select up to `max_pages` candidate URLs based on business priorities.
 
@@ -195,9 +243,10 @@ def select_pages_deterministic(
             seen_normalized.add(norm_key)
             unique_candidates.append(c)
 
-    # 2. Identify and prioritize the homepage
+    # 2. Identify and prioritize the homepage and primary about page
     clean_base = base_url.lower().rstrip("/") if base_url else ""
     homepage_candidate: CandidateURL | None = None
+    about_candidate: CandidateURL | None = None
     other_candidates: list[CandidateURL] = []
 
     for c in unique_candidates:
@@ -213,14 +262,25 @@ def select_pages_deterministic(
 
         if is_home and homepage_candidate is None:
             homepage_candidate = c
+        elif c.page_type == PageType.ABOUT and about_candidate is None:
+            about_candidate = c
         else:
             other_candidates.append(c)
 
-    # 3. Score other candidates
+    # 3. Score other candidates taking product relevance into account
+    keywords = extract_product_keywords(product_or_service) if product_or_service else []
+    product_phrase = product_or_service.strip() if product_or_service else ""
+    has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in other_candidates)
+
     def _calculate_score(candidate: CandidateURL) -> tuple[int, int, str]:
         type_score = PAGE_TYPE_PRIORITY.get(candidate.page_type, 10)
         section_score = SECTION_PRIORITY_BONUS.get(candidate.source_section, 0)
-        total_score = type_score + section_score
+        relevance = calculate_product_relevance(candidate, keywords, product_phrase) if keywords else 0
+        total_score = type_score + section_score + relevance
+
+        # When matching product pages exist, penalize unrelated product pages
+        if has_matches and relevance == 0 and candidate.page_type == PageType.PRODUCT:
+            total_score -= 60
 
         # Shorter paths generally represent higher-level category pages
         path_segments = len([s for s in urllib.parse.urlsplit(candidate.url).path.split("/") if s])
@@ -242,16 +302,34 @@ def select_pages_deterministic(
             )
         )
 
+    if about_candidate is not None and len(selected_pages) < max_pages:
+        selected_pages.append(
+            SelectedPage(
+                url=about_candidate.url,
+                page_type=about_candidate.page_type or PageType.ABOUT,
+                link_text=about_candidate.link_text,
+                source_section=about_candidate.source_section,
+                selection_reason="About page provides foundational brand background, company story, and positioning context.",
+            )
+        )
+
     remaining_slots = max(0, max_pages - len(selected_pages))
     for c in sorted_candidates[:remaining_slots]:
         type_name = c.page_type.value if hasattr(c.page_type, "value") else str(c.page_type)
+        rel = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
+        if rel > 0:
+            reason = f"Selected for target product relevance ({product_phrase}) from {c.source_section}."
+        elif product_phrase and not has_matches:
+            reason = f"Priority {type_name} page selected via deterministic hierarchy (no matching pages for '{product_phrase}' found)."
+        else:
+            reason = f"Priority {type_name} page selected via deterministic hierarchy from {c.source_section}."
         selected_pages.append(
             SelectedPage(
                 url=c.url,
                 page_type=c.page_type,
                 link_text=c.link_text,
                 source_section=c.source_section,
-                selection_reason=f"Priority {type_name} page selected via deterministic hierarchy from {c.source_section}.",
+                selection_reason=reason,
             )
         )
 
@@ -271,30 +349,12 @@ def select_pages_deterministic(
 # LLM-Based Page Selection Implementation
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
-You are a senior digital marketing strategist and competitive intelligence analyst.
-Your task is to select up to {max_pages} URLs from the provided candidate list for deep competitive analysis of a business.
-
-Selection priorities:
-1. Include the Homepage ({homepage_url}) if present and relevant for overall brand positioning.
-2. Core commercial offerings: Products, Services, Solutions, Packages.
-3. Pricing & Plans: Pricing tables, subscription tiers, rates, costs.
-4. Value propositions & Offers: Special deals, discounts, promotions, free trials, why choose us.
-5. Company & Trust: About Us, Company Story, Leadership, Why Us.
-6. Support & Evidence: FAQ, Case Studies, Portfolio.
-
-Rules:
-- Select ONLY URLs that appear in the provided candidate list. NEVER fabricate, modify, or hallucinate URLs.
-- Select up to {max_pages} URLs. If fewer than {max_pages} useful candidates exist, select only the useful ones.
-- Avoid duplicate pages, near-duplicate pages (e.g. multiple pagination pages or minor tag variants), and irrelevant utility endpoints.
-- Provide a concise rationale for each selected URL explaining why it is valuable for competitive marketing analysis.
-"""
-
 
 async def select_pages_with_llm(
     candidates: list[CandidateURL],
     website_url: str,
     *,
+    product_or_service: str | None = None,
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     model: str | None = None,
 ) -> PageSelectionResult:
@@ -327,14 +387,14 @@ async def select_pages_with_llm(
     # 1. Validate OpenAI API Key
     if not settings.OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not configured; using deterministic fallback.")
-        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url)
+        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
         res.error_message = "OPENAI_API_KEY is not configured."
         return res
 
     raw_api_key = settings.OPENAI_API_KEY.get_secret_value().strip()
     if not raw_api_key or raw_api_key in ("your_openai_api_key_here", ""):
         logger.warning("OPENAI_API_KEY is set to a placeholder; using deterministic fallback.")
-        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url)
+        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
         res.error_message = "OPENAI_API_KEY is set to a placeholder value."
         return res
 
@@ -346,12 +406,24 @@ async def select_pages_with_llm(
     norm_candidate_map: dict[str, CandidateURL] = {c.url.lower().rstrip("/"): c for c in candidates}
 
     # 3. Format candidate URLs for the prompt (cap at MAX_PROMPT_CANDIDATES to keep context focused)
-    # Order candidates so priority sections and core types appear prominently
-    sorted_for_prompt = sorted(
-        candidates,
-        key=lambda c: PAGE_TYPE_PRIORITY.get(c.page_type, 10) + SECTION_PRIORITY_BONUS.get(c.source_section, 0),
-        reverse=True,
-    )[:MAX_PROMPT_CANDIDATES]
+    keywords = extract_product_keywords(product_or_service) if product_or_service else []
+    product_phrase = product_or_service.strip() if product_or_service else ""
+    has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in candidates)
+
+    def _prompt_candidate_sort_key(c: CandidateURL) -> tuple[int, int, str]:
+        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 10)
+        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
+        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
+        total_score = type_score + section_score + relevance
+
+        # When matching product pages exist, deprioritize unrelated product pages
+        if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
+            total_score -= 60
+
+        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
+        return (total_score, -path_segments, c.url)
+
+    sorted_for_prompt = sorted(candidates, key=_prompt_candidate_sort_key, reverse=True)[:MAX_PROMPT_CANDIDATES]
 
     formatted_lines: list[str] = []
     for c in sorted_for_prompt:
@@ -359,12 +431,15 @@ async def select_pages_with_llm(
         type_str = c.page_type.value if hasattr(c.page_type, "value") else str(c.page_type)
         formatted_lines.append(f"- URL: {c.url} | Category: {type_str} | Found in: {c.source_section}{text_snippet}")
 
-    system_prompt = _SYSTEM_PROMPT.format(max_pages=max_pages, homepage_url=website_url)
-    user_prompt = (
-        f"Target Website: {website_url}\n"
-        f"Candidate URLs ({len(formatted_lines)} provided out of {len(candidates)} total):\n"
-        + "\n".join(formatted_lines)
-        + f"\n\nSelect up to {max_pages} most valuable pages for competitor marketing intelligence."
+    product_context = f"Target Product / Service: {product_phrase}\n" if product_phrase else ""
+    system_prompt = PAGE_SELECTION_SYSTEM_PROMPT.format(max_pages=max_pages, homepage_url=website_url)
+    user_prompt = PAGE_SELECTION_USER_PROMPT_TEMPLATE.format(
+        website_url=website_url,
+        product_context=product_context,
+        candidate_count=len(formatted_lines),
+        total_candidates=len(candidates),
+        candidate_lines="\n".join(formatted_lines),
+        max_pages=max_pages,
     )
 
     # 4. Invoke OpenAI structured output
@@ -389,7 +464,7 @@ async def select_pages_with_llm(
         parsed_response: StructuredPageSelectionResponse | None = completion.choices[0].message.parsed
         if parsed_response is None or not parsed_response.selected_pages:
             logger.warning("OpenAI model returned empty structured selection; using deterministic fallback.")
-            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url)
+            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
             res.error_message = "OpenAI returned an empty selection response."
             return res
 
@@ -429,7 +504,7 @@ async def select_pages_with_llm(
 
         if not validated_pages:
             logger.warning("No LLM-selected URLs passed candidate membership validation; using fallback.")
-            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url)
+            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
             res.error_message = "All LLM-selected URLs failed candidate membership validation."
             return res
 
@@ -453,7 +528,7 @@ async def select_pages_with_llm(
             type(exc).__name__,
             exc,
         )
-        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url)
+        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
         res.error_message = f"OpenAI call failed ({type(exc).__name__}: {exc}); deterministic fallback used."
         return res
 
@@ -465,6 +540,7 @@ async def select_pages_with_llm(
 async def discover_and_select_pages(
     website_url: str,
     *,
+    product_or_service: str | None = None,
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     model: str | None = None,
     min_priority_links: int = 5,
@@ -496,6 +572,7 @@ async def discover_and_select_pages(
     # 1. Discover website URLs (Homepage + conditional sitemap fallback)
     discovery_result = await discover_website_urls(
         website_url,
+        product_or_service=product_or_service,
         min_priority_links=min_priority_links,
         force_sitemap=force_sitemap,
         timeout_seconds=timeout_seconds,
@@ -524,6 +601,7 @@ async def discover_and_select_pages(
     selection_result = await select_pages_with_llm(
         candidates=discovery_result.candidate_urls,
         website_url=discovery_result.base_url or website_url,
+        product_or_service=product_or_service,
         max_pages=max_pages,
         model=model,
     )
