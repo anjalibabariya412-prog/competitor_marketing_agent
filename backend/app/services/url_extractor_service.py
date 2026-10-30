@@ -258,18 +258,20 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
         "privacy", "policy", "policies", "terms", "tos", "conditions",
         "refund", "refunds", "return", "returns", "shipping", "guarantee",
         "warranty", "legal", "disclaimer", "cookie", "cookies", "gdpr",
-        "compliance", "accessibility",
+        "compliance", "accessibility", "delivery", "cancellation", "exchange", "exchanges",
     }
     if any(k in path_tokens for k in policy_keywords) or any(
         k in path for k in (
             "privacy-policy", "terms-of-service", "terms-and-conditions",
-            "refund-policy", "return-policy", "shipping-policy", "cookie-policy"
+            "refund-policy", "return-policy", "shipping-policy", "cookie-policy",
+            "delivery-policy", "cancellation-policy", "returns-exchanges", "exchange-policy",
         )
     ):
         return PageType.POLICY
     if any(k in text for k in (
         "privacy", "terms of", "terms &", "terms and", "refund",
-        "return policy", "shipping policy", "legal", "disclaimer", "cookie policy"
+        "return policy", "shipping policy", "legal", "disclaimer", "cookie policy",
+        "delivery policy", "cancellation policy", "returns and exchanges", "exchange policy",
     )):
         return PageType.POLICY
 
@@ -277,16 +279,17 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     pricing_keywords = {
         "pricing", "prices", "price", "plans", "packages", "rates",
         "subscription", "subscriptions", "fees", "cost", "tier", "tiers",
+        "membership", "memberships",
     }
     if any(k in path_tokens for k in pricing_keywords) or any(
-        k in text for k in ("pricing", "plans", "rates", "subscription", "subscriptions", "packages")
+        k in text for k in ("pricing", "plans", "rates", "subscription", "subscriptions", "packages", "membership", "memberships")
     ):
         return PageType.PRICING
 
     # 4. FAQ
     faq_keywords = {"faq", "faqs", "help", "support", "questions", "answers"}
     if any(k in path_tokens for k in faq_keywords) or any(
-        k in text for k in ("faq", "faqs", "frequently asked", "help center", "knowledge base")
+        k in text for k in ("faq", "faqs", "frequently asked", "help center", "knowledge base", "questions & answers")
     ):
         return PageType.FAQ
 
@@ -294,13 +297,14 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     about_keywords = {
         "about", "team", "company", "story", "mission", "leadership",
         "careers", "press", "culture", "values", "executives", "directors",
+        "founder", "founders", "heritage",
     }
     if any(k in path_tokens for k in about_keywords) or any(
-        k in path for k in ("about-us", "who-we-are", "our-story", "our-team", "our-company")
+        k in path for k in ("about-us", "who-we-are", "our-story", "our-team", "our-company", "our-heritage", "brand-story")
     ):
         return PageType.ABOUT
     if any(k in text for k in (
-        "about", "who we are", "our story", "our team", "leadership", "company", "mission"
+        "about", "who we are", "our story", "our team", "leadership", "company", "mission", "our heritage", "brand story", "founder"
     )):
         return PageType.ABOUT
 
@@ -321,21 +325,22 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     # 7. Offer & Promotions
     offer_keywords = {
         "offer", "offers", "deals", "deal", "discount", "discounts",
-        "promo", "promotions", "specials", "special", "coupons", "sale", "clearance",
+        "promo", "promotions", "specials", "special", "coupons", "coupon",
+        "sale", "clearance", "bundle", "bundles", "voucher", "vouchers", "combos", "combo",
     }
     if any(k in path_tokens for k in offer_keywords) or any(
-        k in text for k in ("special offer", "deals", "discounts", "promotions", "sale", "clearance")
+        k in text for k in ("special offer", "deals", "discounts", "promotions", "sale", "clearance", "bundle", "bundles", "coupons", "combos")
     ):
         return PageType.OFFER
 
     # 8. Product
     product_keywords = {
         "product", "products", "shop", "store", "collection", "collections",
-        "catalog", "catalogue", "merchandise", "items", "goods",
+        "category", "categories", "catalog", "catalogue", "merchandise", "items", "goods",
         "features", "feature", "platform",
     }
     if any(k in path_tokens for k in product_keywords) or any(
-        k in text for k in ("product", "products", "shop", "store", "collection", "catalog", "features", "platform")
+        k in text for k in ("product", "products", "shop", "store", "collection", "collections", "category", "categories", "catalog", "features", "platform")
     ):
         return PageType.PRODUCT
 
@@ -343,10 +348,10 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     service_keywords = {
         "service", "services", "solution", "solutions", "offerings",
         "capabilities", "treatments", "consulting", "practice", "practices",
-        "use-case", "use-cases", "case-study", "case-studies",
+        "use-case", "use-cases", "case-study", "case-studies", "portfolio",
     }
     if any(k in path_tokens for k in service_keywords) or any(
-        k in text for k in ("service", "services", "solution", "solutions", "what we do", "capabilities", "use cases", "case studies")
+        k in text for k in ("service", "services", "solution", "solutions", "what we do", "capabilities", "use cases", "case studies", "portfolio")
     ):
         return PageType.SERVICE
 

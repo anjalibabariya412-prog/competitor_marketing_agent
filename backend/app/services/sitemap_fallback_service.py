@@ -481,8 +481,8 @@ async def discover_sitemap_urls(
                 sub_sitemaps, raw_page_urls = _extract_sitemap_elements(root)
 
                 # Queue nested sitemaps within depth bounds, prioritizing product/category sitemaps
+                keywords = extract_product_keywords(product_or_service)
                 if depth < max_depth:
-                    keywords = extract_product_keywords(product_or_service)
                     def _sitemap_prio(s_url: str) -> int:
                         s_low = s_url.lower()
                         if any(kw in s_low for kw in keywords):
@@ -500,6 +500,30 @@ async def discover_sitemap_urls(
                         sub_key = sub.lower().rstrip("/")
                         if sub_key not in seen_sitemaps:
                             sitemaps_to_explore.append((sub, depth + 1))
+
+                # If sitemap has many URLs, prioritize candidates by product/service and key category relevance
+                if len(raw_page_urls) > max_urls:
+                    p_phrase = product_or_service.lower().strip() if product_or_service else ""
+                    p_slug = re.sub(r"\s+", "-", p_phrase) if p_phrase else ""
+
+                    def _raw_url_priority(u: str) -> int:
+                        u_low = u.lower()
+                        score = 0
+                        if p_phrase and (p_phrase in u_low or p_slug in u_low):
+                            score += 100
+                        if any(kw in u_low for kw in keywords):
+                            score += 50
+                        if any(k in u_low for k in ("pricing", "price", "plan", "plans", "offer", "offers", "deal", "discount", "bundle")):
+                            score += 40
+                        elif any(k in u_low for k in ("about", "story", "team", "who-we-are", "company", "mission")):
+                            score += 35
+                        elif any(k in u_low for k in ("product", "products", "shop", "collection", "category", "service", "services")):
+                            score += 30
+                        elif any(k in u_low for k in ("faq", "help", "support", "shipping", "return", "policy")):
+                            score += 20
+                        return score
+
+                    raw_page_urls = sorted(raw_page_urls, key=_raw_url_priority, reverse=True)
 
                 # Clean, filter, classify, and deduplicate page URLs
                 for raw_url in raw_page_urls:
@@ -595,14 +619,14 @@ def merge_candidate_urls(
 
     # 1. Add homepage candidates first to preserve their priority and link text
     for c in homepage_candidates:
-        norm_key = c.url.rstrip("/")
+        norm_key = c.url.lower().rstrip("/")
         if norm_key not in seen_urls:
             seen_urls.add(norm_key)
             merged.append(c)
 
     # 2. Add sitemap candidates if not already present
     for s in sitemap_candidates:
-        norm_key = s.url.rstrip("/")
+        norm_key = s.url.lower().rstrip("/")
         if norm_key not in seen_urls:
             seen_urls.add(norm_key)
             merged.append(s)

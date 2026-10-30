@@ -19,6 +19,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import backend.app.main  # Ensure canonical import order
 from backend.app.schemas.enums import PageType
 from backend.app.schemas.scraped_data import ScrapedPage
 from backend.app.services.homepage_service import HomepageFetchResult

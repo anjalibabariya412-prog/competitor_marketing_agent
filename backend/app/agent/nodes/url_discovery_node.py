@@ -27,6 +27,7 @@ from backend.app.services.sitemap_fallback_service import (
     discover_website_urls,
 )
 from backend.app.services.url_extractor_service import CandidateURL
+from bs4 import BeautifulSoup
 from backend.app.services.website_content_crawler_service import _extract_text_from_html
 
 logger = logging.getLogger(__name__)
@@ -59,9 +60,20 @@ def _homepage_html_to_scraped_page(
 
     page_url = homepage_fetch_result.final_url or homepage_fetch_result.requested_url
 
+    extracted_title: str | None = None
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title:
+            raw_title = soup.title.get_text()
+            normalized_title = " ".join(raw_title.split())
+            if normalized_title:
+                extracted_title = normalized_title
+    except Exception:
+        extracted_title = None
+
     return ScrapedPage(
         url=page_url,
-        title=None,
+        title=extracted_title,
         content=text,
         page_type=PageType.HOME,
         status_code=homepage_fetch_result.http_status_code,

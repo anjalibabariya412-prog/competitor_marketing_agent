@@ -35,7 +35,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
 from backend.app.core.config import settings
-from backend.app.agent.prompts import (
+from backend.app.agent.prompts.page_selection import (
     PAGE_SELECTION_SYSTEM_PROMPT,
     PAGE_SELECTION_USER_PROMPT_TEMPLATE,
 )
@@ -202,8 +202,8 @@ def categorize_candidate(candidate: CandidateURL, base_url: str = "") -> Selecti
     # 2. About / Company
     if candidate.page_type == PageType.ABOUT:
         return SelectionCategory.ABOUT
-    about_tokens = ("about", "who-we-are", "our-story", "our-team", "company", "mission", "leadership")
-    if any(t in path for t in about_tokens) or any(t in text for t in ("about", "who we are", "our story", "our team", "leadership", "company", "mission")):
+    about_tokens = ("about", "who-we-are", "our-story", "our-team", "company", "mission", "leadership", "founder", "founders", "heritage", "brand-story")
+    if any(t in path for t in about_tokens) or any(t in text for t in ("about", "who we are", "our story", "our team", "leadership", "company", "mission", "founder", "heritage", "brand story")):
         return SelectionCategory.ABOUT
 
     # 3. Pricing & Offers
@@ -213,10 +213,11 @@ def categorize_candidate(candidate: CandidateURL, base_url: str = "") -> Selecti
         "pricing", "prices", "price", "plans", "packages", "rates",
         "subscription", "subscriptions", "fees", "cost", "tier", "tiers",
         "offer", "offers", "deals", "deal", "discount", "discounts",
-        "promo", "promotions", "sale", "clearance", "coupons",
+        "promo", "promotions", "sale", "clearance", "coupons", "coupon",
+        "bundle", "bundles", "membership", "memberships", "voucher", "combo",
     )
     path_tokens = set(re.split(r"[-_/]", path))
-    if any(t in path_tokens for t in pricing_tokens) or any(t in text for t in ("pricing", "plans", "rates", "subscription", "packages", "deals", "offers", "sale", "discount")):
+    if any(t in path_tokens for t in pricing_tokens) or any(t in text for t in ("pricing", "plans", "rates", "subscription", "packages", "deals", "offers", "sale", "discount", "bundle", "bundles", "coupons", "membership")):
         return SelectionCategory.PRICING_OFFER
 
     # 4. Contact & Booking
@@ -234,11 +235,11 @@ def categorize_candidate(candidate: CandidateURL, base_url: str = "") -> Selecti
         return SelectionCategory.PRODUCT_SERVICE
     product_service_tokens = (
         "product", "products", "shop", "store", "collection", "collections",
-        "catalog", "catalogue", "merchandise", "items", "goods", "features", "feature", "platform",
+        "category", "categories", "catalog", "catalogue", "merchandise", "items", "goods", "features", "feature", "platform",
         "service", "services", "solution", "solutions", "offerings", "capabilities",
-        "treatments", "consulting", "use-case", "use-cases", "case-study", "case-studies",
+        "treatments", "consulting", "use-case", "use-cases", "case-study", "case-studies", "portfolio",
     )
-    if any(t in path_tokens for t in product_service_tokens) or any(t in text for t in ("product", "products", "shop", "collection", "service", "services", "solutions", "features")):
+    if any(t in path_tokens for t in product_service_tokens) or any(t in text for t in ("product", "products", "shop", "collection", "category", "service", "services", "solutions", "features", "portfolio")):
         return SelectionCategory.PRODUCT_SERVICE
 
     # 6. Other Relevant (FAQ, Policies, Blog, Reviews)
@@ -290,8 +291,9 @@ def _get_path_stem(url: str) -> str:
     """Extract a normalized path stem without trailing query params or variant tokens."""
     parsed = urllib.parse.urlsplit(url.lower().rstrip("/"))
     path = parsed.path
-    # Strip common product variant suffixes (e.g. -shade-01, -01, etc.)
+    # Strip common product variant suffixes (e.g. -shade-01, -01, -shade-pink, etc.)
     stem = re.sub(r"[-_](?:shade|color|colour|size|variant|v)?[0-9]+$", "", path)
+    stem = re.sub(r"[-_](?:shade|color|colour|size|variant)[-_][a-z0-9]+$", "", stem)
     return stem
 
 
@@ -442,15 +444,21 @@ def select_pages_deterministic(
     prod_candidates = buckets[SelectionCategory.PRODUCT_SERVICE]
     if prod_candidates and len(selected_pages) < max_pages:
         # Determine quota for product/service in this first pass (leave room for pricing/contact/etc.)
+        pricing_candidates = buckets[SelectionCategory.PRICING_OFFER]
+        slots_remaining = max_pages - len(selected_pages)
         if has_matches:
             # Allocate up to min(3, remaining slots) for relevant products
-            prod_quota = min(3, max_pages - len(selected_pages))
+            prod_quota = min(3, slots_remaining)
             matching_prod = [c for c in prod_candidates if calculate_product_relevance(c, keywords, product_phrase) > 0]
             unrelated_prod = [c for c in prod_candidates if calculate_product_relevance(c, keywords, product_phrase) == 0]
             prod_queue = matching_prod + unrelated_prod
         else:
-            prod_quota = min(2, max_pages - len(selected_pages))
+            prod_quota = min(2, slots_remaining)
             prod_queue = prod_candidates
+
+        # If pricing/offer candidates exist and slots are tight, reserve at least 1 slot for them
+        if pricing_candidates and slots_remaining <= 3 and prod_quota >= slots_remaining:
+            prod_quota = max(1, slots_remaining - 1)
 
         added_prod = 0
         # Check if diverse product stems exist
@@ -636,6 +644,105 @@ def _select_balanced_candidates_for_prompt(
     return selected_prompt_candidates
 
 
+def is_selection_ambiguous(
+    candidates: list[CandidateURL],
+    *,
+    max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
+    base_url: str = "",
+    product_or_service: str | None = None,
+) -> tuple[bool, str]:
+    """Evaluate whether candidate URL prioritization is genuinely ambiguous.
+
+    Deterministic rules can resolve candidate selection confidently when:
+    - Candidate count is within or equal to `max_pages`.
+    - Key categories are clearly identified and distinctively prioritized.
+    - User's supplied product matches explicit URL/anchor tokens.
+    - No tie exists at the cutoff boundary between candidates.
+
+    Returns:
+        (is_ambiguous: bool, reason: str)
+    """
+    if not candidates:
+        return False, "no_candidates"
+
+    # Deduplicate candidates by normalized URL
+    seen_normalized: set[str] = set()
+    unique_candidates: list[CandidateURL] = []
+    for c in candidates:
+        norm_key = c.url.lower().rstrip("/")
+        if norm_key not in seen_normalized:
+            seen_normalized.add(norm_key)
+            unique_candidates.append(c)
+
+    if len(unique_candidates) <= max_pages:
+        return False, "candidate_count_within_budget"
+
+    # Check if OpenAI API key is configured
+    if not settings.OPENAI_API_KEY:
+        return False, "llm_not_configured"
+
+    raw_key = settings.OPENAI_API_KEY.get_secret_value().strip()
+    if not raw_key or raw_key in ("your_openai_api_key_here", ""):
+        return False, "llm_placeholder_key"
+
+    # Extract product keywords
+    keywords = extract_product_keywords(product_or_service) if product_or_service else []
+    product_phrase = product_or_service.strip() if product_or_service else ""
+    has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in unique_candidates) if keywords else False
+
+    # Ambiguity Trigger 1: User requested a specific product/service, but no keyword match was found
+    # yet there are multiple product/service/other candidates that could be semantically relevant
+    if product_phrase and not has_matches:
+        prod_candidates = [
+            c for c in unique_candidates
+            if c.page_type in (PageType.PRODUCT, PageType.SERVICE, PageType.OTHER, PageType.UNKNOWN)
+        ]
+        if len(prod_candidates) > 2:
+            return True, f"product_unmatched_by_keywords ('{product_phrase}')"
+
+    # Score and rank candidates using deterministic rank function
+    def _rank_candidate(c: CandidateURL) -> tuple[int, int, str]:
+        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
+        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
+        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
+        total_score = type_score + section_score + relevance
+
+        norm_url = c.url.lower()
+        if any(seg in norm_url for seg in ("/collection", "/collections", "/category", "/categories")):
+            total_score += 40
+
+        if c.page_type == PageType.FAQ:
+            total_score += 10
+        elif c.page_type == PageType.POLICY:
+            if any(term in norm_url for term in ("shipping", "refund", "return", "delivery")):
+                total_score += 10
+            elif any(term in norm_url for term in ("privacy", "terms", "cookie")):
+                total_score -= 15
+
+        if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
+            total_score -= 60
+
+        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
+        return (total_score, -path_segments, c.url)
+
+    ranked = sorted(unique_candidates, key=_rank_candidate, reverse=True)
+
+    # Ambiguity Trigger 2: High proportion of UNKNOWN or OTHER among top candidates
+    top_candidates = ranked[: max_pages * 2]
+    unclassified_count = sum(1 for c in top_candidates if c.page_type in (PageType.UNKNOWN, PageType.OTHER))
+    if len(top_candidates) >= 4 and (unclassified_count / len(top_candidates)) >= 0.40:
+        return True, "high_ratio_of_unclassified_candidates"
+
+    # Ambiguity Trigger 3: Score tie at the cutoff boundary
+    if len(ranked) > max_pages:
+        score_in = _rank_candidate(ranked[max_pages - 1])[0]
+        score_out = _rank_candidate(ranked[max_pages])[0]
+        if score_in == score_out and score_in > 0:
+            return True, f"score_tie_at_boundary (score: {score_in})"
+
+    return False, "deterministic_selection_confident"
+
+
 async def select_pages_with_llm(
     candidates: list[CandidateURL],
     website_url: str,
@@ -643,8 +750,13 @@ async def select_pages_with_llm(
     product_or_service: str | None = None,
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     model: str | None = None,
+    force_llm: bool = False,
 ) -> PageSelectionResult:
-    """Select a balanced set of up to `max_pages` relevant candidate URLs using structured OpenAI completion.
+    """Select a balanced set of up to `max_pages` relevant candidate URLs.
+
+    Deterministic, rule-based prioritization is the primary selection method.
+    The LLM is invoked only as a bounded fallback when deterministic rules cannot
+    confidently resolve genuinely ambiguous candidates and an LLM call is justified.
 
     Validates that:
     - Every selected URL exists in the input candidate list (rejects hallucinated URLs).
@@ -662,6 +774,7 @@ async def select_pages_with_llm(
         product_or_service: Optional primary product or service focus.
         max_pages: Maximum number of pages to select.
         model: Optional LLM model identifier. Defaults to shared configuration (settings.LLM_MODEL).
+        force_llm: Force the LLM fallback path even when deterministic rules are confident.
 
     Returns:
         A populated :class:`PageSelectionResult` instance.
@@ -674,19 +787,47 @@ async def select_pages_with_llm(
             error_message="Candidate list is empty; no pages to select.",
         )
 
-    # 1. Validate OpenAI API Key
+    # 1. Primary Selection: Run deterministic prioritization first
+    deterministic_result = select_pages_deterministic(
+        candidates,
+        max_pages=max_pages,
+        base_url=website_url,
+        product_or_service=product_or_service,
+    )
+
+    # 2. Check if selection is ambiguous and an LLM fallback call is justified
+    is_ambiguous, ambiguity_reason = is_selection_ambiguous(
+        candidates,
+        max_pages=max_pages,
+        base_url=website_url,
+        product_or_service=product_or_service,
+    )
+
+    if not force_llm and not is_ambiguous:
+        logger.info(
+            "Deterministic page selection resolved %d pages confidently (%s); skipping LLM call.",
+            deterministic_result.total_selected,
+            ambiguity_reason,
+        )
+        return deterministic_result
+
+    # 3. Validate OpenAI API Key for LLM fallback
     if not settings.OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not configured; using deterministic fallback.")
-        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
-        res.error_message = "OPENAI_API_KEY is not configured."
-        return res
+        deterministic_result.error_message = "OPENAI_API_KEY is not configured."
+        return deterministic_result
 
     raw_api_key = settings.OPENAI_API_KEY.get_secret_value().strip()
     if not raw_api_key or raw_api_key in ("your_openai_api_key_here", ""):
         logger.warning("OPENAI_API_KEY is set to a placeholder; using deterministic fallback.")
-        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
-        res.error_message = "OPENAI_API_KEY is set to a placeholder value."
-        return res
+        deterministic_result.error_message = "OPENAI_API_KEY is set to a placeholder value."
+        return deterministic_result
+
+    logger.info(
+        "Candidate selection is ambiguous (%s); invoking bounded LLM fallback for %s.",
+        ambiguity_reason,
+        website_url,
+    )
 
     # Resolve LLM model identifier (defaults to shared settings.LLM_MODEL)
     selected_model = model or settings.LLM_MODEL

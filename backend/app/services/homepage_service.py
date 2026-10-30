@@ -22,7 +22,7 @@ import datetime
 import logging
 import time
 import urllib.parse
-from typing import Literal
+from typing import Any, Literal
 
 from apify_client import ApifyClient
 from apify_client.errors import ApifyApiError
@@ -41,6 +41,16 @@ PLAYWRIGHT_ACTOR_ID = "apify/playwright-scraper"
 
 # Maximum seconds to allow the Apify Actor run to complete.
 DEFAULT_ACTOR_TIMEOUT_SECONDS = 120
+
+# Default milliseconds to wait after navigation for client-side JavaScript hydration
+DEFAULT_RENDER_WAIT_MS = 1500
+MIN_RENDER_WAIT_MS = 0
+MAX_RENDER_WAIT_MS = 10_000
+
+# Default maximum pixel scroll height for triggering lazy-loaded homepage content
+DEFAULT_MAX_SCROLL_HEIGHT_PIXELS = 2500
+MIN_SCROLL_HEIGHT_PIXELS = 0
+MAX_SCROLL_HEIGHT_PIXELS = 10_000
 
 # Number of retries for transient Actor failures (network hiccup, Actor startup error).
 # Permanent errors (auth failure, bad URL) are NOT retried.
@@ -80,48 +90,83 @@ _BLOCK_SIGNALS: tuple[str, ...] = _DEFINITIVE_BLOCK_SIGNALS + _AMBIGUOUS_BLOCK_S
 # pageFunction – JavaScript executed inside the Playwright browser context.
 #
 # The function is a string because it runs inside the Apify Actor's Node.js
-# environment, not in Python.  It:
-#   1. Retrieves the full rendered HTML via page.content().
-#   2. Records page.url() as the final URL after any redirects.
-#   3. Records the HTTP response status via the context's `response` object.
-#   4. Returns all three values so they land in the Actor's dataset.
+# environment, not in Python. It:
+#   1. Records page.url() as the final URL after any redirects.
+#   2. Performs a short, bounded wait for client-side JavaScript hydration.
+#   3. Performs limited step-wise scrolling to trigger lazy-loaded sections.
+#   4. Retrieves the final rendered HTML via page.content().
+#   5. Records the HTTP response status via the context's `response` object.
+#   6. Returns all values so they land in the Actor's dataset.
 #
 # Reference: https://apify.com/apify/playwright-scraper – pageFunction context
 # ---------------------------------------------------------------------------
 
-_PAGE_FUNCTION = """\
-async function pageFunction(context) {
-    const { page, request, response, log } = context;
+def _build_page_function(render_wait_ms: int, max_scroll_pixels: int) -> str:
+    """Build the JavaScript pageFunction string with configured wait and scroll limits."""
+    return f"""\
+async function pageFunction(context) {{
+    const {{ page, request, response, log }} = context;
 
     // Capture the final URL after all redirects.
-    const finalUrl = page.url();
+    let finalUrl = request ? request.url : null;
+    try {{
+        finalUrl = page.url();
+    }} catch (e) {{}}
 
-    // Capture the full rendered HTML.
-    const html = await page.content();
+    // 1. Bounded additional wait for JavaScript hydration and dynamic rendering
+    try {{
+        await new Promise(resolve => setTimeout(resolve, {render_wait_ms}));
+    }} catch (e) {{}}
+
+    // 2. Limited step-wise scrolling to trigger lazy-loaded sections and promotional banners
+    try {{
+        await page.evaluate(async (maxScroll) => {{
+            const step = 500;
+            for (let y = step; y <= maxScroll; y += step) {{
+                window.scrollTo(0, y);
+                await new Promise(r => setTimeout(r, 200));
+            }}
+            // Scroll back to top so top announcement bars and sticky headers settle in place
+            window.scrollTo(0, 0);
+            await new Promise(r => setTimeout(r, 150));
+        }}, {max_scroll_pixels});
+    }} catch (e) {{}}
+
+    // 3. Capture the full rendered HTML after wait and scrolling have completed
+    let html = '';
+    try {{
+        html = await page.content();
+    }} catch (e) {{
+        try {{
+            html = await page.evaluate(() => document.documentElement.outerHTML);
+        }} catch (e2) {{}}
+    }}
 
     // HTTP status code is safely extracted as a number or null.
-    // In Apify playwright-scraper, context.response is { status: number, headers: object }.
+    // In Apify playwright-scraper, context.response is {{ status: number, headers: object }}.
     let httpStatusCode = null;
-    if (response) {
-        if (typeof response.status === 'number') {
+    if (response) {{
+        if (typeof response.status === 'number') {{
             httpStatusCode = response.status;
-        } else if (typeof response.status === 'function') {
-            try { httpStatusCode = response.status(); } catch (e) {}
-        }
-    }
+        }} else if (typeof response.status === 'function') {{
+            try {{ httpStatusCode = response.status(); }} catch (e) {{}}
+        }}
+    }}
 
-    if (log && typeof log.info === 'function') {
-        log.info('Fetched ' + finalUrl + ' (HTTP ' + httpStatusCode + ', ' + html.length + ' bytes)');
-    }
+    if (log && typeof log.info === 'function') {{
+        log.info('Fetched ' + finalUrl + ' (HTTP ' + httpStatusCode + ', ' + (html ? html.length : 0) + ' bytes)');
+    }}
 
-    return {
+    return {{
         requestedUrl: request ? request.url : null,
         finalUrl: finalUrl,
         html: html,
         httpStatusCode: httpStatusCode,
-    };
-}
+    }};
+}}
 """
+
+_PAGE_FUNCTION = _build_page_function(DEFAULT_RENDER_WAIT_MS, DEFAULT_MAX_SCROLL_HEIGHT_PIXELS)
 
 # ---------------------------------------------------------------------------
 # Result model
@@ -241,23 +286,67 @@ def _is_blocked_html(html: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Configuration Clamping Helpers
+# ---------------------------------------------------------------------------
+
+def _clamp_render_wait_ms(wait_ms: Any) -> int:
+    """Clamp the rendering hydration wait to the safe range [0, 10000] ms."""
+    try:
+        val = int(wait_ms)
+        return min(max(MIN_RENDER_WAIT_MS, val), MAX_RENDER_WAIT_MS)
+    except (ValueError, TypeError):
+        return DEFAULT_RENDER_WAIT_MS
+
+
+def _clamp_scroll_height_pixels(scroll_pixels: Any) -> int:
+    """Clamp the scroll height to the safe range [0, 10000] pixels."""
+    try:
+        val = int(scroll_pixels)
+        return min(max(MIN_SCROLL_HEIGHT_PIXELS, val), MAX_SCROLL_HEIGHT_PIXELS)
+    except (ValueError, TypeError):
+        return DEFAULT_MAX_SCROLL_HEIGHT_PIXELS
+
+
+# ---------------------------------------------------------------------------
 # Actor input builder
 # ---------------------------------------------------------------------------
 
-def _build_actor_input(url: str) -> dict:
-    """Construct the minimal Apify Playwright Scraper input for a single-page fetch.
+def _build_actor_input(
+    url: str,
+    render_wait_ms: int | None = None,
+    max_scroll_pixels: int | None = None,
+) -> dict:
+    """Construct the Apify Playwright Scraper input for a single-page fetch.
 
     Configuration choices:
     - ``maxPagesPerCrawl=1`` / ``maxResultsPerCrawl=1``: fetch exactly one page.
     - ``globs=[]`` / ``pseudoUrls=[]`` / ``linkSelector=""``: no link following.
-    - ``waitUntil="domcontentloaded"``: wait for JS-rendered content.
+    - ``waitUntil="domcontentloaded"``: fast initial DOM navigation.
+    - ``pageFunction``: executes bounded client-side hydration wait and step-wise scrolling
+      to trigger lazy-loaded sections and dynamic announcement banners.
+    - ``maxScrollHeightPixels=0``: disabled on the Actor level to avoid duplicate scrolling passes;
+      scrolling is handled exclusively by the custom pageFunction.
     - ``launcher="chromium"``: default headless browser.
     - ``proxyConfiguration={"useApifyProxy": True}``: required by the Actor.
-    - ``maxRequestRetries=0``: we handle retries at the Python layer; Actor
-      internal retries would multiply cost unnecessarily.
-    - ``downloadMedia=False`` / ``downloadCss=False``: reduce bandwidth and
-      Actor compute time for a raw homepage fetch.
+    - ``maxRequestRetries=0``: retries handled at Python layer.
+    - ``downloadMedia=False`` / ``downloadCss=False``: reduce bandwidth and Actor compute.
     """
+    raw_wait_ms = (
+        render_wait_ms
+        if render_wait_ms is not None
+        else getattr(settings, "HOMEPAGE_RENDER_WAIT_MS", DEFAULT_RENDER_WAIT_MS)
+    )
+    raw_scroll_pixels = (
+        max_scroll_pixels
+        if max_scroll_pixels is not None
+        else getattr(settings, "HOMEPAGE_MAX_SCROLL_HEIGHT_PIXELS", DEFAULT_MAX_SCROLL_HEIGHT_PIXELS)
+    )
+
+    resolved_wait_ms = _clamp_render_wait_ms(raw_wait_ms)
+    resolved_scroll_pixels = _clamp_scroll_height_pixels(raw_scroll_pixels)
+
+    page_fn = _build_page_function(resolved_wait_ms, resolved_scroll_pixels)
+
     return {
         "startUrls": [{"url": url}],
         "globs": [],
@@ -266,7 +355,7 @@ def _build_actor_input(url: str) -> dict:
         "linkSelector": "",
         "keepUrlFragments": False,
         "respectRobotsTxtFile": False,
-        "pageFunction": _PAGE_FUNCTION,
+        "pageFunction": page_fn,
         "proxyConfiguration": {"useApifyProxy": True},
         "proxyRotation": "RECOMMENDED",
         "initialCookies": [],
@@ -441,6 +530,8 @@ async def fetch_homepage(
     website_url: str,
     *,
     timeout_seconds: int = DEFAULT_ACTOR_TIMEOUT_SECONDS,
+    render_wait_ms: int | None = None,
+    max_scroll_pixels: int | None = None,
 ) -> HomepageFetchResult:
     """Fetch the rendered homepage for the given business website URL.
 
@@ -493,7 +584,11 @@ async def fetch_homepage(
             execution_time_seconds=round(time.monotonic() - start_time, 2),
         )
 
-    actor_input = _build_actor_input(normalized_url)
+    actor_input = _build_actor_input(
+        normalized_url,
+        render_wait_ms=render_wait_ms,
+        max_scroll_pixels=max_scroll_pixels,
+    )
 
     # --- 3. Run the Actor with bounded retries ---
     items: list[dict] = []

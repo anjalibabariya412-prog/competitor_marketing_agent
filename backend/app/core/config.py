@@ -78,6 +78,18 @@ class Settings(BaseSettings):
         default=240,
         description="Maximum execution timeout in seconds for Apify website content crawler actor.",
     )
+    HOMEPAGE_RENDER_WAIT_MS: int = Field(
+        default=1500,
+        ge=0,
+        le=10_000,
+        description="Additional milliseconds to wait for dynamic JS hydration on the homepage (bounded to 0-10000).",
+    )
+    HOMEPAGE_MAX_SCROLL_HEIGHT_PIXELS: int = Field(
+        default=2500,
+        ge=0,
+        le=10_000,
+        description="Maximum pixel scroll height for triggering lazy-loaded homepage content (bounded to 0-10000).",
+    )
     MAX_COMPETITORS: int = Field(
         default=5,
         description="Maximum total number of competitors to analyze.",

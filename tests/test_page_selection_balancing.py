@@ -259,6 +259,7 @@ class TestPageSelectionBalancing(unittest.IsolatedAsyncioTestCase):
                 candidates,
                 website_url="https://store.example.com",
                 max_pages=4,
+                force_llm=True,
             )
 
             selected_urls = [p.url for p in result.selected_pages]
@@ -292,6 +293,7 @@ class TestPageSelectionBalancing(unittest.IsolatedAsyncioTestCase):
                 candidates,
                 website_url="https://saas.example.com",
                 max_pages=3,
+                force_llm=True,
             )
 
             self.assertEqual(result.selection_method, "deterministic_fallback")
@@ -377,6 +379,148 @@ class TestPageSelectionBalancing(unittest.IsolatedAsyncioTestCase):
             res = select_pages_deterministic(candidates, max_pages=max_limit, base_url="https://example.com")
             self.assertLessEqual(res.total_selected, max_limit)
             self.assertLessEqual(len(res.selected_pages), max_limit)
+
+    async def test_13_deterministic_selection_without_api_key(self):
+        """Scenario 13: Deterministic selection functions cleanly when OpenAI API key is missing."""
+        candidates = [
+            CandidateURL(url="https://shop.example.com/", link_text="Home", page_type=PageType.HOME, source_section="nav"),
+            CandidateURL(url="https://shop.example.com/about", link_text="About", page_type=PageType.ABOUT, source_section="nav"),
+            CandidateURL(url="https://shop.example.com/pricing", link_text="Plans", page_type=PageType.PRICING, source_section="nav"),
+            CandidateURL(url="https://shop.example.com/products/widget", link_text="Widget", page_type=PageType.PRODUCT, source_section="content"),
+        ]
+
+        with patch("backend.app.services.page_selection_service.settings.OPENAI_API_KEY", None):
+            result = await select_pages_with_llm(
+                candidates,
+                website_url="https://shop.example.com",
+                max_pages=4,
+            )
+            self.assertEqual(result.selection_method, "deterministic_fallback")
+            self.assertEqual(result.total_selected, 4)
+            selected_urls = [p.url for p in result.selected_pages]
+            self.assertIn("https://shop.example.com/", selected_urls)
+            self.assertIn("https://shop.example.com/about", selected_urls)
+            self.assertIn("https://shop.example.com/pricing", selected_urls)
+            self.assertIn("https://shop.example.com/products/widget", selected_urls)
+
+    async def test_14_ambiguous_selection_triggers_bounded_llm_fallback(self):
+        """Scenario 14: Genuinely ambiguous candidates (score tie at cutoff) trigger bounded LLM fallback automatically."""
+        # Setup: 6 candidates for 4 slots, where candidates at boundary (3 and 4) have identical scores
+        candidates = [
+            CandidateURL(url="https://brand.example.com/", link_text="Home", page_type=PageType.HOME, source_section="nav"),
+            CandidateURL(url="https://brand.example.com/about-us", link_text="About Us", page_type=PageType.ABOUT, source_section="nav"),
+            CandidateURL(url="https://brand.example.com/items/alpha", link_text="Alpha Item", page_type=PageType.PRODUCT, source_section="content"),
+            CandidateURL(url="https://brand.example.com/items/beta", link_text="Beta Item", page_type=PageType.PRODUCT, source_section="content"),
+            CandidateURL(url="https://brand.example.com/items/gamma", link_text="Gamma Item", page_type=PageType.PRODUCT, source_section="content"),
+            CandidateURL(url="https://brand.example.com/items/delta", link_text="Delta Item", page_type=PageType.PRODUCT, source_section="content"),
+        ]
+
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    parsed=StructuredPageSelectionResponse(
+                        selected_pages=[
+                            PageSelectionDecision(url="https://brand.example.com/", reason="Brand identity"),
+                            PageSelectionDecision(url="https://brand.example.com/about-us", reason="Company story"),
+                            PageSelectionDecision(url="https://brand.example.com/items/alpha", reason="Flagship product"),
+                            PageSelectionDecision(url="https://brand.example.com/items/gamma", reason="Differentiated product"),
+                        ]
+                    )
+                )
+            )
+        ]
+
+        with patch("backend.app.services.page_selection_service.AsyncOpenAI") as mock_openai_cls, \
+             patch("backend.app.services.page_selection_service.settings.OPENAI_API_KEY") as mock_key:
+            mock_key.get_secret_value.return_value = "sk-test-valid-key"
+            mock_client = AsyncMock()
+            mock_client.beta.chat.completions.parse.return_value = mock_response
+            mock_openai_cls.return_value = mock_client
+
+            result = await select_pages_with_llm(
+                candidates,
+                website_url="https://brand.example.com",
+                max_pages=4,
+            )
+
+            # LLM was invoked due to tie-break ambiguity among product candidates
+            self.assertEqual(result.selection_method, "llm")
+            self.assertEqual(result.total_selected, 4)
+            mock_client.beta.chat.completions.parse.assert_awaited_once()
+            # Selected URLs strictly belong to candidates
+            candidate_set = {c.url for c in candidates}
+            for p in result.selected_pages:
+                self.assertIn(p.url, candidate_set)
+
+    async def test_15_confident_selection_skips_llm_call(self):
+        """Scenario 15: Confident, unambiguous candidate set resolves deterministically and skips LLM call."""
+        candidates = [
+            CandidateURL(url="https://saas.example.com/", link_text="Home", page_type=PageType.HOME, source_section="nav"),
+            CandidateURL(url="https://saas.example.com/about", link_text="About", page_type=PageType.ABOUT, source_section="nav"),
+            CandidateURL(url="https://saas.example.com/pricing", link_text="Pricing", page_type=PageType.PRICING, source_section="nav"),
+            CandidateURL(url="https://saas.example.com/contact", link_text="Contact", page_type=PageType.CONTACT, source_section="nav"),
+            CandidateURL(url="https://saas.example.com/features", link_text="Core Platform", page_type=PageType.PRODUCT, source_section="nav"),
+        ]
+
+        with patch("backend.app.services.page_selection_service.AsyncOpenAI") as mock_openai_cls, \
+             patch("backend.app.services.page_selection_service.settings.OPENAI_API_KEY") as mock_key:
+            mock_key.get_secret_value.return_value = "sk-test-valid-key"
+            mock_client = AsyncMock()
+            mock_openai_cls.return_value = mock_client
+
+            result = await select_pages_with_llm(
+                candidates,
+                website_url="https://saas.example.com",
+                max_pages=5,
+            )
+
+            # Did NOT call OpenAI because candidate count is within budget and selection is confident
+            mock_client.beta.chat.completions.parse.assert_not_called()
+            self.assertEqual(result.selection_method, "deterministic_fallback")
+            self.assertEqual(result.total_selected, 5)
+
+    def test_16_extended_page_classification_and_categorization(self):
+        """Scenario 16: Extended keyword rules classify category, bundles, delivery, and founder pages."""
+        from backend.app.services.url_extractor_service import classify_page_type
+
+        cases = [
+            ("https://store.example.com/categories/skincare", "Shop Categories", PageType.PRODUCT),
+            ("https://store.example.com/bundles/starter-kit", "Value Bundle", PageType.OFFER),
+            ("https://store.example.com/delivery-policy", "Delivery & Shipping", PageType.POLICY),
+            ("https://store.example.com/our-founder", "Meet Our Founder", PageType.ABOUT),
+            ("https://store.example.com/membership", "Join Membership", PageType.PRICING),
+            ("https://store.example.com/help-center", "Help Center", PageType.FAQ),
+        ]
+
+        for url, text, expected_type in cases:
+            pt = classify_page_type(url, text)
+            self.assertEqual(pt, expected_type, f"URL {url} should classify as {expected_type}")
+
+    def test_17_sitemap_candidates_merged_without_duplicates(self):
+        """Scenario 17: Sitemap candidate merging handles casing and trailing slash normalization without duplicates."""
+        from backend.app.services.sitemap_fallback_service import merge_candidate_urls
+
+        homepage_candidates = [
+            CandidateURL(url="https://example.com/about", link_text="About Us", page_type=PageType.ABOUT, source_section="nav"),
+            CandidateURL(url="https://example.com/products/a", link_text="Product A", page_type=PageType.PRODUCT, source_section="nav"),
+        ]
+        sitemap_candidates = [
+            CandidateURL(url="https://example.com/about/", link_text="", page_type=PageType.ABOUT, source_section="sitemap"),
+            CandidateURL(url="https://example.com/Products/A", link_text="", page_type=PageType.PRODUCT, source_section="sitemap"),
+            CandidateURL(url="https://example.com/pricing", link_text="", page_type=PageType.PRICING, source_section="sitemap"),
+        ]
+
+        merged = merge_candidate_urls(homepage_candidates, sitemap_candidates, base_url="https://example.com")
+        self.assertEqual(len(merged), 3)
+        urls = [c.url for c in merged]
+        self.assertIn("https://example.com/about", urls)
+        self.assertIn("https://example.com/products/a", urls)
+        self.assertIn("https://example.com/pricing", urls)
+        # Ensure homepage candidate metadata was preserved
+        about_c = next(c for c in merged if "about" in c.url.lower())
+        self.assertEqual(about_c.link_text, "About Us")
+        self.assertEqual(about_c.source_section, "nav")
 
 
 if __name__ == "__main__":

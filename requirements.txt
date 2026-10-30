@@ -18,4 +18,8 @@ langgraph-checkpoint-postgres
 
 apify-client
 beautifulsoup4
-
+
+alembic
+psycopg[binary]
+
+pydantic-settings

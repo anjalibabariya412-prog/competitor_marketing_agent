@@ -155,6 +155,36 @@ _PRICE_INDICATOR_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Patterns identifying marketing, promotional, discount, shipping, or trust copy
+_PROMOTIONAL_TEXT_REGEX = re.compile(
+    r"(?i)("
+    r"\b\d+%\s*off\b|"
+    r"\b(?:sale|discount|discounts|special offer|limited time|flash sale|clearance|save\s*(?:up to|\$|₹|€|£|\d+))\b|"
+    r"\b(?:coupon|promo code|discount code|voucher|use code|code\s*:\s*[A-Z0-9_-]+)\b|"
+    r"\bfree\s+(?:shipping|delivery|returns|worldwide shipping|shipping over|delivery over)\b|"
+    r"\b(?:standard shipping|express delivery|same[- ]day delivery|next[- ]day delivery)\b|"
+    r"\b(?:money[- ]back guarantee|satisfaction guaranteed|\d+[- ]day (?:returns|guarantee|trial|money[- ]back)|risk[- ]free)\b|"
+    r"\b(?:free trial|try free|get started free|claim your|shop the sale|shop now and save|subscribe & save|subscribe and save)\b|"
+    r"\b(?:cruelty[- ]free|dermatologist[- ]tested|certified organic|100% natural|vegan)\b|"
+    r"(?:₹|\$|€|£)\s*\d+(?:\.\d{2})?"
+    r")"
+)
+
+# Container class/id/role identifying marketing, announcement, or banner containers
+_PROMOTIONAL_CONTAINER_REGEX = re.compile(
+    r"(?i)\b(?:promo|promotional|announcement|announcements|banner|offer|offers|deal|deals|discount|discounts|sale|coupon|top[-_]?bar|notification[-_]?bar|header[-_]?bar|hero|alert[-_]?bar)\b"
+)
+
+# Container class/id/role identifying pure navigation elements
+_NAVIGATION_CONTAINER_REGEX = re.compile(
+    r"(?i)\b(?:nav|navbar|navigation|nav[-_]?menu|site[-_]?nav|main[-_]?nav|header[-_]?nav|menu[-_]?list|nav[-_]?links|primary[-_]?menu|global[-_]?nav|user[-_]?menu|account[-_]?menu|dropdown[-_]?menu|main[-_]?menu|site[-_]?menu|header[-_]?menu|menu)\b"
+)
+
+# Slider/carousel cloned track elements that cause duplicate text
+_SLIDER_CLONE_CLASS_REGEX = re.compile(
+    r"(?i)\b(?:slick[-_]?cloned|swiper[-_]?slide[-_]?duplicate|clone|cloned)\b"
+)
+
 _MULTIPLE_NEWLINES_REGEX = re.compile(r"\n{3,}")
 _MULTIPLE_SPACES_REGEX = re.compile(r"[ \t]{2,}")
 
@@ -274,10 +304,112 @@ def _normalize_target_url(url: str) -> str | None:
 
 
 def _clean_html_fragment(soup: BeautifulSoup) -> None:
-    """Clean unwanted elements while preserving content-rich forms (products, bookings)."""
-    for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "svg", "aside"]):
+    """Clean unwanted elements while preserving promotional text, hero sections, and content-rich forms.
+
+    Preserves:
+    - Promotional announcement bars, discount codes, and shipping offers.
+    - Hero-section headlines, descriptions, and calls to action inside header or sections.
+    - Promotional aside callouts and trust guarantees.
+    - Substantive content forms (add-to-cart, bookings, calculators).
+
+    Excludes:
+    - Scripts, styles, noscript, svg, iframe, canvas.
+    - Navigation containers (<nav>, role="navigation", header navigation menus, link lists).
+    - Slider/carousel cloned duplicate elements.
+    - Cookie banners and notices.
+    - Search and newsletter subscription forms.
+    - Non-promotional sidebars and footer boilerplate.
+    """
+    # 1. Technical noise elements
+    for tag in soup(["script", "style", "noscript", "svg", "iframe", "canvas"]):
         tag.decompose()
 
+    # 2. Cloned carousel slides and cookie banner elements
+    for elem in soup.find_all(True):
+        if elem.decomposed:
+            continue
+        classes = " ".join(elem.get("class") or []).lower()
+        elem_id = (elem.get("id") or "").lower()
+        if _SLIDER_CLONE_CLASS_REGEX.search(classes) or elem.get("data-clone") is not None:
+            elem.decompose()
+            continue
+        if "cookie-banner" in classes or "cookie-notice" in elem_id or "cookie-banner" in elem_id:
+            elem.decompose()
+            continue
+
+    # 3. Pure navigation tags and roles
+    for nav in soup.find_all(["nav"]):
+        nav.decompose()
+
+    for nav_role in soup.find_all(attrs={"role": re.compile(r"^(navigation|menubar)$", re.IGNORECASE)}):
+        nav_role.decompose()
+
+    # 4. Header elements: preserve promotional banners and hero content, filter navigation menus
+    for header in soup.find_all("header"):
+        for child in list(header.find_all(True)):
+            if child.decomposed:
+                continue
+            child_classes = " ".join(child.get("class") or []).lower()
+            child_id = (child.get("id") or "").lower()
+            is_promo = (
+                bool(_PROMOTIONAL_CONTAINER_REGEX.search(child_classes))
+                or bool(_PROMOTIONAL_CONTAINER_REGEX.search(child_id))
+                or bool(_PROMOTIONAL_TEXT_REGEX.search(child.get_text()))
+            )
+            if not is_promo:
+                if _NAVIGATION_CONTAINER_REGEX.search(child_classes) or _NAVIGATION_CONTAINER_REGEX.search(child_id):
+                    child.decompose()
+                    continue
+                # Decompose link lists in header with links and no promo text
+                if child.name in ("ul", "ol") and child.find_all("a"):
+                    child.decompose()
+                    continue
+
+        # Deduplicate sibling children inside promotional/announcement containers in header
+        for promo_container in header.find_all(True):
+            if promo_container.decomposed:
+                continue
+            c_classes = " ".join(promo_container.get("class") or []).lower()
+            c_id = (promo_container.get("id") or "").lower()
+            if _PROMOTIONAL_CONTAINER_REGEX.search(c_classes) or _PROMOTIONAL_CONTAINER_REGEX.search(c_id):
+                seen_texts: set[str] = set()
+                for sub in list(promo_container.children):
+                    if hasattr(sub, "get_text"):
+                        sub_text = sub.get_text().strip()
+                        if sub_text:
+                            if sub_text in seen_texts:
+                                sub.decompose()
+                            else:
+                                seen_texts.add(sub_text)
+
+        header.unwrap()
+
+    # 5. Aside elements: preserve promotional callouts/banners, remove sidebars/ad noise
+    for aside in soup.find_all("aside"):
+        aside_classes = " ".join(aside.get("class") or []).lower()
+        aside_id = (aside.get("id") or "").lower()
+        aside_text = aside.get_text().strip()
+
+        is_promo = (
+            bool(_PROMOTIONAL_CONTAINER_REGEX.search(aside_classes))
+            or bool(_PROMOTIONAL_CONTAINER_REGEX.search(aside_id))
+            or bool(_PROMOTIONAL_TEXT_REGEX.search(aside_text))
+        )
+
+        if is_promo:
+            for nav in aside.find_all(["nav"]):
+                nav.decompose()
+            for nav_role in aside.find_all(attrs={"role": re.compile(r"^(navigation|menubar)$", re.IGNORECASE)}):
+                nav_role.decompose()
+            aside.unwrap()
+        else:
+            aside.decompose()
+
+    # 6. Footer elements
+    for footer in soup.find_all("footer"):
+        footer.decompose()
+
+    # 7. Form cleaning: preserve substantive commerce/booking forms, remove search/newsletter noise
     for form in soup.find_all("form"):
         role = (form.get("role") or "").lower()
         classes = " ".join(form.get("class") or []).lower()
@@ -301,13 +433,40 @@ def _clean_html_fragment(soup: BeautifulSoup) -> None:
 
 
 def _extract_text_from_html(html_str: str) -> str:
-    """Extract clean readable text from HTML markup, discarding scripts/styles/noise."""
+    """Extract clean readable text from HTML markup, discarding scripts/styles/noise.
+
+    Preserves:
+    - Promotional announcement bars, discount codes, shipping offers.
+    - Hero-section headlines, descriptions, and calls to action.
+    - Product offerings, pricing, and trust messages.
+
+    Excludes:
+    - Scripts, styles, noscript, svg, iframe.
+    - Navigation menus (<nav>, role="navigation", menu lists).
+    - Search and newsletter forms.
+    - Footer boilerplate and cookie banners.
+    - Duplicate slider/marquee clone lines.
+    """
     if not html_str or not html_str.strip():
         return ""
     try:
         soup = BeautifulSoup(html_str, "html.parser")
         _clean_html_fragment(soup)
-        return soup.get_text(separator="\n")
+        raw_text = soup.get_text(separator="\n")
+
+        # Clean lines and remove consecutive duplicate lines (e.g. from ticker/marquee/slider duplicates)
+        lines = [line.strip() for line in raw_text.splitlines()]
+        deduped_lines: list[str] = []
+        for line in lines:
+            if not line:
+                if deduped_lines and deduped_lines[-1] != "":
+                    deduped_lines.append("")
+                continue
+            if deduped_lines and deduped_lines[-1] == line:
+                continue
+            deduped_lines.append(line)
+
+        return "\n".join(deduped_lines).strip()
     except Exception:
         return ""
 
