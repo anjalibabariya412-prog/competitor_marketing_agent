@@ -774,20 +774,17 @@ async def generate_business_overview(
     stated_product = ""
     stated_audience = ""
     audience_unknown = False
-    stated_social = ""
 
     if hasattr(business_form, "business_name_and_description"):
         stated_name_desc = business_form.business_name_and_description
         stated_product = business_form.product_or_service
         stated_audience = business_form.target_audience or ""
         audience_unknown = business_form.audience_unknown
-        stated_social = business_form.social_link or ""
     elif isinstance(business_form, dict):
         stated_name_desc = business_form.get("business_name_and_description", "")
         stated_product = business_form.get("product_or_service", "")
         stated_audience = business_form.get("target_audience", "") or ""
         audience_unknown = bool(business_form.get("audience_unknown", False))
-        stated_social = business_form.get("social_link", "") or ""
 
     intake_parts: list[str] = []
     if stated_name_desc:
@@ -798,8 +795,6 @@ async def generate_business_overview(
         intake_parts.append(f"- Stated Target Audience: {stated_audience}")
     elif audience_unknown:
         intake_parts.append("- Stated Target Audience: Not specified by user (audience_unknown=True)")
-    if stated_social:
-        intake_parts.append(f"- Stated Social Link: {stated_social}")
 
     user_intake_context = "\n".join(intake_parts) if intake_parts else "No user intake provided; derive strictly from crawled content."
     product_focus = stated_product if stated_product else "Core commercial offerings"

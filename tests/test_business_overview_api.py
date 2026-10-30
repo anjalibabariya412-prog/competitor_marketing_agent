@@ -42,7 +42,6 @@ def _sample_form_payload() -> dict[str, Any]:
         "target_audience": "Eco-conscious consumers aged 25-50 seeking non-toxic, peptide-rich anti-aging skincare",
         "audience_unknown": False,
         "business_website": "https://www.luminabotanicals.com",
-        "social_link": "https://www.instagram.com/luminabotanicals",
     }
 
 
@@ -137,20 +136,20 @@ class TestBusinessOverviewAPI(unittest.TestCase):
         error_str = str(response.json())
         self.assertIn("Localhost URLs are not allowed", error_str)
 
-    def test_request_validation_rejects_invalid_social_link_domain(self) -> None:
-        """Verify 422 when social_link is from an unsupported domain (e.g. twitter/x)."""
+    def test_request_validation_rejects_extra_forbidden_fields(self) -> None:
+        """Verify 422 when unexpected extra fields such as social_link are provided."""
         payload = {
             "business_name_and_description": "Lumina Botanicals is an organic clean-label skincare brand.",
             "product_or_service": "Handmade botanical skincare and serums",
             "target_audience": "Skin health enthusiasts",
             "audience_unknown": False,
             "business_website": "https://www.luminabotanicals.com",
-            "social_link": "https://twitter.com/luminabotanicals",
+            "social_link": "https://www.instagram.com/luminabotanicals",
         }
         response = self.client.post("/api/v1/business-overview", json=payload)
         self.assertEqual(response.status_code, 422)
         error_str = str(response.json())
-        self.assertIn("social_link", error_str)
+        self.assertIn("extra_forbidden", error_str)
 
     def test_successful_business_overview_generation(self) -> None:
         """Verify successful 200 response when workflow completes end-to-end with mock data."""

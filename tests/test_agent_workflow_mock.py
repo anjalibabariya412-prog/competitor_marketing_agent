@@ -48,7 +48,6 @@ def _create_sample_business_form() -> BusinessForm:
         target_audience="Eco-conscious consumers aged 25-50 seeking non-toxic, peptide-rich anti-aging skincare",
         audience_unknown=False,
         business_website="https://www.luminabotanicals.com",
-        social_link="https://www.instagram.com/luminabotanicals",
     )
 
 
