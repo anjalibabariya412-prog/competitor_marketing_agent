@@ -5,6 +5,11 @@ It extracts the business website URL from the shared `AgentState`, triggers the
 existing URL discovery service (which orchestrates homepage fetching, candidate URL
 extraction, and conditional sitemap fallback), and stores the results back into
 `AgentState`.
+
+Phase 1 addition: After URL discovery, the homepage HTML (already fetched internally
+by the discovery service) is converted into a ``ScrapedPage`` and stored in
+``homepage_scraped_page`` so that the Website Crawling node can merge it into the
+final page set without issuing a second network request.
 """
 
 from __future__ import annotations
@@ -14,13 +19,70 @@ from typing import Any
 
 from ..state import AgentState
 from backend.app.schemas.business_form import BusinessForm
+from backend.app.schemas.enums import PageType
+from backend.app.schemas.scraped_data import ScrapedPage
+from backend.app.services.homepage_service import HomepageFetchResult
 from backend.app.services.sitemap_fallback_service import (
     WebsiteURLDiscoveryResult,
     discover_website_urls,
 )
 from backend.app.services.url_extractor_service import CandidateURL
+from backend.app.services.website_content_crawler_service import (
+    MIN_PAGE_CONTENT_CHARS,
+    _extract_text_from_html,
+)
 
 logger = logging.getLogger(__name__)
+
+# Limit homepage text to match the per-page cap used by business_overview_service
+# (MAX_PAGE_INPUT_CHARS = 6000) so the homepage does not drown out other pages.
+_HOMEPAGE_MAX_CHARS: int = 6_000
+
+
+def _homepage_html_to_scraped_page(
+    homepage_fetch_result: HomepageFetchResult,
+) -> ScrapedPage | None:
+    """Convert a successful ``HomepageFetchResult`` into a ``ScrapedPage``.
+
+    Returns ``None`` when:
+    - The fetch status is not ``"success"``.
+    - The HTML is missing or empty.
+    - The extracted text is shorter than ``MIN_PAGE_CONTENT_CHARS`` (too sparse to be useful).
+
+    The extracted text is capped at ``_HOMEPAGE_MAX_CHARS`` characters to avoid
+    crowding out other pages when passed to the Business Overview LLM.
+    """
+    if homepage_fetch_result.status != "success":
+        return None
+
+    html = homepage_fetch_result.html or ""
+    if not html.strip():
+        return None
+
+    text = _extract_text_from_html(html).strip()
+
+    if len(text) < MIN_PAGE_CONTENT_CHARS:
+        logger.debug(
+            "Homepage text too short (%d chars < %d min); skipping ScrapedPage conversion.",
+            len(text),
+            MIN_PAGE_CONTENT_CHARS,
+        )
+        return None
+
+    # Cap text to avoid overshadowing other pages in the LLM context
+    if len(text) > _HOMEPAGE_MAX_CHARS:
+        text = text[:_HOMEPAGE_MAX_CHARS].rsplit("\n", 1)[0].strip()
+
+    page_url = homepage_fetch_result.final_url or homepage_fetch_result.requested_url
+
+    return ScrapedPage(
+        url=page_url,
+        title=None,
+        content=text,
+        page_type=PageType.HOME,
+        status_code=homepage_fetch_result.http_status_code,
+        metadata={},
+    )
 
 
 async def url_discovery_node(state: AgentState) -> dict[str, Any]:
@@ -141,7 +203,37 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
             "errors": existing_errors,
         }
 
-    # 5. Successful or partial discovery with usable candidate URLs
+    # 5. Successful or partial discovery with usable candidate URLs.
+    # Convert the homepage HTML (already fetched inside discover_website_urls) into a
+    # ScrapedPage so the Website Crawling node can include it without a second fetch.
+    homepage_scraped_page: ScrapedPage | None = None
+    hp_fetch_result = getattr(discovery_result, "homepage_fetch_result", None)
+    if hp_fetch_result is not None:
+        try:
+            homepage_scraped_page = _homepage_html_to_scraped_page(hp_fetch_result)
+            if homepage_scraped_page:
+                logger.info(
+                    "Homepage converted to ScrapedPage (%d chars) for '%s' (page_type=%s).",
+                    len(homepage_scraped_page.content),
+                    homepage_scraped_page.url,
+                    homepage_scraped_page.page_type,
+                )
+            else:
+                logger.debug(
+                    "Homepage HTML for '%s' could not be converted to a usable ScrapedPage "
+                    "(status='%s', html present=%s).",
+                    clean_url,
+                    getattr(hp_fetch_result, "status", "unknown"),
+                    bool(getattr(hp_fetch_result, "html", None)),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Non-fatal: failed to convert homepage HTML to ScrapedPage for '%s': %s",
+                clean_url,
+                exc,
+            )
+            homepage_scraped_page = None
+
     logger.info(
         "URL Discovery Node completed successfully for '%s': %d candidate URLs discovered "
         "(status: '%s', homepage: '%s', sitemap triggered: %s).",
@@ -155,6 +247,7 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
     return {
         "discovery_result": discovery_result,
         "candidate_urls": discovery_result.candidate_urls,
+        "homepage_scraped_page": homepage_scraped_page,
         "current_step": "url_discovery",
         "workflow_status": "running",
     }

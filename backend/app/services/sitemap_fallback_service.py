@@ -147,6 +147,17 @@ class WebsiteURLDiscoveryResult(BaseModel):
         default_factory=list,
         description="List of important business page categories still missing.",
     )
+    # Internal field: carries the homepage fetch result so the URL Discovery Node
+    # can convert it into a ScrapedPage without a second HTTP request.
+    # Not serialized into the public API response.
+    homepage_fetch_result: HomepageFetchResult | None = Field(
+        default=None,
+        description=(
+            "Homepage fetch result used during URL discovery. "
+            "Available internally to downstream workflow nodes; not exposed via public API."
+        ),
+        exclude=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -748,4 +759,5 @@ async def discover_website_urls(
         total_candidates=total_candidates,
         covered_categories=covered,
         missing_categories=missing,
+        homepage_fetch_result=homepage_fetch_result,
     )

@@ -203,7 +203,32 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
             "errors": existing_errors,
         }
 
-    # 6. Successful or partial crawl with usable content
+    # 6. Successful or partial crawl with usable content.
+    # Merge homepage_scraped_page (captured during URL Discovery) into scraped_pages,
+    # placing it first and deduplicating by normalized URL so the homepage is never
+    # counted twice if the Apify crawler also happened to return it.
+    homepage_scraped_page: ScrapedPage | None = state.get("homepage_scraped_page")  # type: ignore[assignment]
+    final_scraped_pages: list[ScrapedPage] = list(crawl_result.scraped_pages)
+
+    if homepage_scraped_page is not None:
+        # Normalize URLs for comparison: strip trailing slash, ignore scheme case
+        crawled_urls_normalized = {p.url.rstrip("/").lower() for p in final_scraped_pages}
+        hp_url_normalized = homepage_scraped_page.url.rstrip("/").lower()
+        if hp_url_normalized not in crawled_urls_normalized:
+            final_scraped_pages = [homepage_scraped_page] + final_scraped_pages
+            logger.info(
+                "Homepage ScrapedPage ('%s', %d chars) merged into scraped_pages. "
+                "Total pages now: %d.",
+                homepage_scraped_page.url,
+                len(homepage_scraped_page.content),
+                len(final_scraped_pages),
+            )
+        else:
+            logger.debug(
+                "Homepage URL '%s' already present in crawled pages; skipping merge.",
+                homepage_scraped_page.url,
+            )
+
     logger.info(
         "Website Crawling Node completed for '%s': status='%s', scraped=%d/%d, failed=%d.",
         clean_url,
@@ -215,8 +240,9 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
 
     update: dict[str, Any] = {
         "crawl_result": crawl_result,
-        "scraped_pages": crawl_result.scraped_pages,
+        "scraped_pages": final_scraped_pages,
         "failed_pages": crawl_result.failed_pages,
+        "homepage_scraped_page": homepage_scraped_page,
         "current_step": "website_crawling",
         "workflow_status": "running",
     }

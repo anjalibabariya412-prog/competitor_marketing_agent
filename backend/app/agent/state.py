@@ -57,6 +57,10 @@ class AgentState(TypedDict, total=False):
     # Combined candidate URLs extracted from homepage HTML and XML sitemaps
     candidate_urls: list[CandidateURL] | None
 
+    # Homepage content converted to a ScrapedPage during URL Discovery so it can
+    # be merged into scraped_pages by the Website Crawling node without a second fetch.
+    homepage_scraped_page: ScrapedPage | None
+
     # ---------------------------------------------------------------------------
     # C. Page Selection
     # ---------------------------------------------------------------------------
