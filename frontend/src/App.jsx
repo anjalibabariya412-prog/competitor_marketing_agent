@@ -26,18 +26,6 @@ export default function App() {
     saveSessionState(session);
   }, [session]);
 
-  // Sync theme attribute on document root
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', session.theme || 'light');
-  }, [session.theme]);
-
-  const handleToggleTheme = () => {
-    setSession((prev) => ({
-      ...prev,
-      theme: prev.theme === 'dark' ? 'light' : 'dark',
-    }));
-  };
-
   const handleStepClick = (targetStep) => {
     if (targetStep < session.currentStep) {
       setSession((prev) => ({ ...prev, currentStep: targetStep }));
@@ -143,8 +131,6 @@ export default function App() {
       <TopBar
         currentStep={session.currentStep}
         onStepClick={handleStepClick}
-        theme={session.theme}
-        onToggleTheme={handleToggleTheme}
       />
 
       <main className={`main-layout-viewport ${isWideLayout ? 'viewport-wide' : 'viewport-form'}`}>

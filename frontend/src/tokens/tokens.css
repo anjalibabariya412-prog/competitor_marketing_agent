@@ -83,37 +83,7 @@
   --trans-fast: 150ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-/* Dark Theme Overrides */
-[data-theme="dark"] {
-  --color-midnight: #0B0F19;
-  --bg-main: #0B0F19;
-  --bg-white: #111827;
-  --bg-surface-subtle: #1F2937;
-  --bg-surface-hover: #374151;
-  --bg-input: #111827;
 
-  --text-primary: #F8FAFC;
-  --text-secondary: #94A3B8;
-  --text-muted: #64748B;
-
-  --border-subtle: #1F2937;
-  --border-strong: #374151;
-
-  --color-pale-blue: #1E293B;
-  --color-pale-blue-border: #2563EB;
-  --focus-ring: 0 0 0 3px rgba(49, 94, 251, 0.35);
-
-  --color-success-bg: #052E16;
-  --color-success-border: #14532D;
-  --color-error-bg: #450A0A;
-  --color-error-border: #7F1D1D;
-  --color-notice-bg: #451A03;
-  --color-notice-border: #78350F;
-
-  --shadow-xs: none;
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.5);
-}
 
 @media (prefers-reduced-motion: reduce) {
   * {

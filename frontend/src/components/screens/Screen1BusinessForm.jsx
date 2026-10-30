@@ -37,7 +37,7 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
   if (nameDescLen === 0) {
     nameDescError = 'Business name and description is required.';
   } else if (nameDescLen < 20) {
-    nameDescError = `Please enter at least 20 characters (${nameDescLen}/20).`;
+    nameDescError = 'Please enter at least 20 characters.';
   } else if (nameDescLen > 500) {
     nameDescError = 'Please limit your description to 500 characters.';
   }
@@ -80,6 +80,12 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
 
   const handleSubmit = (e) => {
     e.preventDefault();
+    setTouched({
+      business_name_and_description: true,
+      product_or_service: true,
+      target_audience: true,
+      business_website: true,
+    });
     if (!isValid || isLoading) return;
 
     onSubmit({
@@ -103,14 +109,11 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
 
         <form onSubmit={handleSubmit} noValidate autoComplete="off" className="form-stack">
             {/* Field 1: Business name and description */}
-            <div className={`form-field ${touched.business_name_and_description && nameDescError ? 'has-error' : ''}`}>
+            <div className={`form-field ${(touched.business_name_and_description || nameDescLen > 500) && nameDescError ? 'has-error' : ''}`}>
               <div className="field-header">
                 <label htmlFor="business_name_and_description" className="field-label">
                   Business name and description<span className="req-star" aria-hidden="true">*</span>
                 </label>
-                <span className="char-counter" aria-live="polite">
-                  {nameDescLen}/500 {nameDescLen > 0 && nameDescLen < 20 ? '(min 20)' : ''}
-                </span>
               </div>
 
               <textarea
@@ -125,10 +128,10 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
                 onBlur={() => handleBlur('business_name_and_description')}
                 disabled={isLoading}
                 maxLength={510}
-                aria-invalid={Boolean(touched.business_name_and_description && nameDescError)}
+                aria-invalid={Boolean((touched.business_name_and_description || nameDescLen > 500) && nameDescError)}
               />
 
-              {touched.business_name_and_description && nameDescError && (
+              {(touched.business_name_and_description || nameDescLen > 500) && nameDescError && (
                 <p className="field-error-msg" role="alert">
                   <AlertCircleIcon size="sm" />
                   <span>{nameDescError}</span>
@@ -137,14 +140,11 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
             </div>
 
             {/* Field 2: Main product or service */}
-            <div className={`form-field ${touched.product_or_service && prodError ? 'has-error' : ''}`}>
+            <div className={`form-field ${(touched.product_or_service || prodLen > 300) && prodError ? 'has-error' : ''}`}>
               <div className="field-header">
                 <label htmlFor="product_or_service" className="field-label">
                   Main product or service<span className="req-star" aria-hidden="true">*</span>
                 </label>
-                <span className="char-counter" aria-live="polite">
-                  {prodLen}/300
-                </span>
               </div>
 
               <input
@@ -159,10 +159,10 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
                 onBlur={() => handleBlur('product_or_service')}
                 disabled={isLoading}
                 maxLength={310}
-                aria-invalid={Boolean(touched.product_or_service && prodError)}
+                aria-invalid={Boolean((touched.product_or_service || prodLen > 300) && prodError)}
               />
 
-              {touched.product_or_service && prodError && (
+              {(touched.product_or_service || prodLen > 300) && prodError && (
                 <p className="field-error-msg" role="alert">
                   <AlertCircleIcon size="sm" />
                   <span>{prodError}</span>
@@ -171,16 +171,11 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
             </div>
 
             {/* Field 3: Target audience */}
-            <div className={`form-field ${touched.target_audience && audError ? 'has-error' : ''}`}>
+            <div className={`form-field ${(touched.target_audience || audLen > 300) && audError ? 'has-error' : ''}`}>
               <div className="field-header">
                 <label htmlFor="target_audience" className="field-label">
                   Target audience{!formData.audience_unknown && <span className="req-star" aria-hidden="true">*</span>}
                 </label>
-                {!formData.audience_unknown && (
-                  <span className="char-counter" aria-live="polite">
-                    {audLen}/300
-                  </span>
-                )}
               </div>
 
               <input
@@ -199,10 +194,10 @@ export function Screen1BusinessForm({ initialData, onSubmit, isLoading }) {
                 onBlur={() => handleBlur('target_audience')}
                 disabled={formData.audience_unknown || isLoading}
                 maxLength={310}
-                aria-invalid={Boolean(touched.target_audience && audError)}
+                aria-invalid={Boolean((touched.target_audience || audLen > 300) && audError)}
               />
 
-              {touched.target_audience && audError && (
+              {(touched.target_audience || audLen > 300) && audError && (
                 <p className="field-error-msg" role="alert">
                   <AlertCircleIcon size="sm" />
                   <span>{audError}</span>
