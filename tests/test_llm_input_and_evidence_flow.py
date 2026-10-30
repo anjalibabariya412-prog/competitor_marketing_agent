@@ -30,12 +30,9 @@ from backend.app.services.business_overview_service import (
     BusinessOverview,
     BusinessOverviewResult,
     InformationGap,
-    MAX_TOTAL_INPUT_CHARS,
-    MAX_PAGE_INPUT_CHARS,
     ProductServiceItem,
     TargetAudienceInfo,
     ValueProposition,
-    _allocate_page_budgets,
     _format_pages_for_prompt,
     _normalize_url_for_comparison,
     _resolve_and_verify_source_url,
@@ -94,7 +91,7 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
             self.assertIn(p.content, formatted_text)
 
     def test_02_very_long_product_page_does_not_crowd_out_homepage_and_about(self):
-        """Scenario 2: An unusually long product page is bounded so Homepage and About content are preserved."""
+        """Scenario 2: An unusually long product page is included in full without crowding out Homepage and About content."""
         # Page 1: 500-char Homepage
         home_page = ScrapedPage(
             url="https://saas.example.com/",
@@ -135,13 +132,12 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://saas.example.com/features/deep-spec", included_urls)
         self.assertIn("https://saas.example.com/pricing", included_urls)
 
-        # Content from Home, About, and Pricing must be fully preserved
+        # Content from Home, About, Features, and Pricing must be fully preserved
         self.assertIn("Enterprise Workflow Automation Platform", formatted_text)
         self.assertIn("Built by former infrastructure engineers", formatted_text)
         self.assertIn("Starter Plan: $29/mo", formatted_text)
-
-        # Total formatted characters must strictly respect MAX_TOTAL_INPUT_CHARS
-        self.assertLessEqual(len(formatted_text), MAX_TOTAL_INPUT_CHARS)
+        self.assertIn(giant_product.content.strip(), formatted_text)
+        self.assertNotIn("[... Content truncated", formatted_text)
 
     def test_03_pricing_and_offer_content_remains_represented(self):
         """Scenario 3: Pricing and promotional offer pages remain represented when available alongside multiple products."""
@@ -185,8 +181,8 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Checkup & Cleaning: $120", formatted_text)
         self.assertIn("0% interest financing", formatted_text)
 
-    def test_04_total_formatted_input_respects_configured_limit(self):
-        """Scenario 4: Total prompt input characters strictly respect MAX_TOTAL_INPUT_CHARS across many large pages."""
+    def test_04_multiple_long_pages_included_completely(self):
+        """Scenario 4: Multiple long pages (>6,000 chars each) are all included with their complete content without truncation."""
         # 8 pages, each containing 12,000 chars of text (total 96,000 raw chars)
         pages = [
             ScrapedPage(
@@ -201,10 +197,13 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         formatted_text, included_pages = _format_pages_for_prompt(pages)
 
         self.assertEqual(len(included_pages), 8)
-        self.assertLessEqual(len(formatted_text), MAX_TOTAL_INPUT_CHARS)
+        self.assertNotIn("[... Content truncated", formatted_text)
+        for p in pages:
+            self.assertIn(p.content.strip(), formatted_text)
+        self.assertGreater(len(formatted_text), 90_000)
 
-    def test_05_truncation_is_deterministic(self):
-        """Scenario 5: Formatting and truncation are completely deterministic across multiple runs."""
+    def test_05_formatting_is_deterministic(self):
+        """Scenario 5: Page formatting is completely deterministic across multiple runs."""
         pages = [
             ScrapedPage(
                 url=f"https://example.com/doc/{i}",
@@ -255,21 +254,29 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Title: B2B Growth Consulting", formatted_text)
         self.assertIn("Type: service", formatted_text)
 
-    def test_08_page_tracking_and_boundary_truncation(self):
-        """Scenario 8: Truncated pages contain the truncation marker and do not corrupt text boundaries."""
-        large_content = "\n\n".join([f"Paragraph {i}: Detailed discussion of product capabilities." for i in range(1, 300)])
+    def test_08_page_longer_than_6000_chars_and_tail_content_retained(self):
+        """Scenario 8: A page longer than 6,000 chars reaches the prompt without truncation, and tail content is retained."""
+        body_paragraphs = [f"Paragraph {i}: Detailed discussion of product capabilities." for i in range(1, 200)]
+        tail_evidence = "CRITICAL_TAIL_EVIDENCE: Unique lifetime replacement warranty policy for all enterprise clients."
+        body_paragraphs.append(tail_evidence)
+        large_content = "\n\n".join(body_paragraphs)
+
         page = ScrapedPage(
             url="https://example.com/big-page",
-            title="Big Page",
+            title="Big Enterprise Page",
             content=large_content,
             page_type=PageType.PRODUCT,
         )
 
-        formatted_text, included_pages = _format_pages_for_prompt([page], max_total_chars=2000, max_page_chars=1800)
+        formatted_text, included_pages = _format_pages_for_prompt([page])
 
         self.assertEqual(len(included_pages), 1)
-        self.assertIn("[... Content truncated for input budget ...]", formatted_text)
-        self.assertLessEqual(len(formatted_text), 2000)
+        self.assertGreater(len(page.content), 6_000)
+        self.assertNotIn("[... Content truncated", formatted_text)
+        self.assertIn("CRITICAL_TAIL_EVIDENCE: Unique lifetime replacement warranty policy", formatted_text)
+        self.assertIn("--- Page 1: https://example.com/big-page", formatted_text)
+        self.assertIn("Title: Big Enterprise Page", formatted_text)
+        self.assertIn("Type: product", formatted_text)
 
     def test_09_fabricated_url_in_llm_response_rejected(self):
         """Scenario 9: Hallucinated URLs in LLM findings or products are sanitized and rejected."""

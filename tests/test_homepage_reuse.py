@@ -4,7 +4,8 @@ Verifies that:
 1. ``WebsiteURLDiscoveryResult`` carries the ``homepage_fetch_result`` from
    ``discover_website_urls()`` (sitemap_fallback_service).
 2. ``_homepage_html_to_scraped_page()`` correctly converts HTML to a ``ScrapedPage``
-   and rejects invalid/sparse inputs.
+   and rejects only genuinely invalid inputs (failed fetches, empty HTML, empty text).
+   No minimum-length threshold is applied and no upper character cap is enforced.
 3. The URL Discovery node stores ``homepage_scraped_page`` in the state update.
 4. The Website Crawling node merges ``homepage_scraped_page`` into ``scraped_pages``.
 5. Duplicate homepage URLs are not inserted twice.
@@ -110,7 +111,11 @@ def _make_crawl_result(pages: list[ScrapedPage]) -> WebsiteCrawlResult:
 # ---------------------------------------------------------------------------
 
 class TestHomepageHtmlToScrapedPage(unittest.TestCase):
-    """Unit tests for the _homepage_html_to_scraped_page conversion helper."""
+    """Unit tests for the _homepage_html_to_scraped_page conversion helper.
+
+    Length restrictions removed: no minimum-length threshold, no 6,000-character cap.
+    Only genuinely empty or failed content is rejected.
+    """
 
     def setUp(self) -> None:
         # Import lazily so module-level fixtures resolve correctly
@@ -144,11 +149,13 @@ class TestHomepageHtmlToScrapedPage(unittest.TestCase):
         result = self._convert(_make_homepage_fetch_result(html="   \n\t  "))
         self.assertIsNone(result)
 
-    def test_sparse_html_returns_none(self) -> None:
-        """HTML that extracts to fewer than MIN_PAGE_CONTENT_CHARS chars must yield None."""
+    def test_sparse_html_preserved(self) -> None:
+        """Short but non-empty homepage text is preserved — no minimum-length threshold."""
         sparse_html = "<html><body><p>Hi</p></body></html>"
         result = self._convert(_make_homepage_fetch_result(html=sparse_html))
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, ScrapedPage)
+        self.assertIn("Hi", result.content)
 
     def test_page_type_is_home(self) -> None:
         """Converted page must have PageType.HOME."""
@@ -180,15 +187,21 @@ class TestHomepageHtmlToScrapedPage(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.url, _HOMEPAGE_URL)
 
-    def test_content_capped_at_max_chars(self) -> None:
-        """Extracted content must not exceed _HOMEPAGE_MAX_CHARS characters."""
-        from backend.app.agent.nodes.url_discovery_node import _HOMEPAGE_MAX_CHARS
-        # Build HTML with content well above the cap
+    def test_long_content_preserved_in_full(self) -> None:
+        """Homepage content longer than 6,000 characters is preserved completely, not truncated."""
         long_text = "Widget information about our products and services. " * 500
         long_html = f"<html><body><p>{long_text}</p></body></html>"
         result = self._convert(_make_homepage_fetch_result(html=long_html))
         self.assertIsNotNone(result)
-        self.assertLessEqual(len(result.content), _HOMEPAGE_MAX_CHARS)
+        # Extracted text must be longer than the old 6,000-char cap
+        self.assertGreater(len(result.content), 6_000)
+
+    def test_empty_extracted_text_returns_none(self) -> None:
+        """HTML that yields only whitespace after extraction must return None."""
+        # Tags-only HTML: BeautifulSoup extracts an empty string
+        tags_only_html = "<html><head></head><body><div></div></body></html>"
+        result = self._convert(_make_homepage_fetch_result(html=tags_only_html))
+        self.assertIsNone(result)
 
     def test_status_code_preserved(self) -> None:
         """HTTP status code from the fetch result is propagated to ScrapedPage."""
@@ -492,6 +505,294 @@ class TestWebsiteCrawlingNodeHomepageMerge(unittest.IsolatedAsyncioTestCase):
             result = await website_crawling_node(self._make_state(homepage_scraped_page=hp_page))
 
         self.assertEqual(result["scraped_pages"][0].page_type, PageType.HOME)
+
+    async def test_homepage_preserved_when_crawling_raises_exception(self) -> None:
+        """Scenario 2: Homepage is preserved in scraped_pages when internal crawling raises an exception."""
+        from backend.app.agent.nodes.website_crawling_node import website_crawling_node
+
+        hp_page = self._make_homepage_page()
+
+        with patch(
+            "backend.app.agent.nodes.website_crawling_node.crawl_selected_pages",
+            side_effect=RuntimeError("Apify connection timed out"),
+        ):
+            result = await website_crawling_node(self._make_state(homepage_scraped_page=hp_page))
+
+        self.assertEqual(len(result["scraped_pages"]), 1)
+        self.assertEqual(result["scraped_pages"][0].url, _HOMEPAGE_URL)
+        self.assertEqual(result["workflow_status"], "running")
+        self.assertEqual(result["crawl_result"].status, "failed")
+        self.assertTrue(result["crawl_result"].has_usable_content)
+
+    async def test_homepage_preserved_when_crawling_returns_empty_result(self) -> None:
+        """Scenario 3: Homepage is preserved in scraped_pages when internal crawling returns empty result."""
+        from backend.app.agent.nodes.website_crawling_node import website_crawling_node
+
+        hp_page = self._make_homepage_page()
+        empty_crawl = WebsiteCrawlResult(
+            website_url=_HOMEPAGE_URL,
+            status="empty",
+            scraped_pages=[],
+            failed_pages=[],
+            total_requested=1,
+            total_scraped=0,
+            total_failed=1,
+            has_usable_content=False,
+            error_message="Zero usable pages returned.",
+        )
+
+        with patch(
+            "backend.app.agent.nodes.website_crawling_node.crawl_selected_pages",
+            new=AsyncMock(return_value=empty_crawl),
+        ):
+            result = await website_crawling_node(self._make_state(homepage_scraped_page=hp_page))
+
+        self.assertEqual(len(result["scraped_pages"]), 1)
+        self.assertEqual(result["scraped_pages"][0].url, _HOMEPAGE_URL)
+        self.assertEqual(result["workflow_status"], "running")
+        self.assertTrue(result["crawl_result"].has_usable_content)
+
+    async def test_homepage_preserved_when_crawling_has_no_usable_content(self) -> None:
+        """Scenario 4: Homepage is preserved when internal crawling failed and has_usable_content is False."""
+        from backend.app.agent.nodes.website_crawling_node import website_crawling_node
+        from backend.app.services.website_content_crawler_service import FailedPageScrape
+
+        hp_page = self._make_homepage_page()
+        failed_crawl = WebsiteCrawlResult(
+            website_url=_HOMEPAGE_URL,
+            status="failed",
+            scraped_pages=[],
+            failed_pages=[
+                FailedPageScrape(
+                    url="https://www.example.com/products",
+                    error_message="WAF block",
+                    page_type=PageType.PRODUCT,
+                )
+            ],
+            total_requested=1,
+            total_scraped=0,
+            total_failed=1,
+            has_usable_content=False,
+            error_message="All requested pages failed.",
+        )
+
+        with patch(
+            "backend.app.agent.nodes.website_crawling_node.crawl_selected_pages",
+            new=AsyncMock(return_value=failed_crawl),
+        ):
+            result = await website_crawling_node(self._make_state(homepage_scraped_page=hp_page))
+
+        self.assertEqual(len(result["scraped_pages"]), 1)
+        self.assertEqual(result["scraped_pages"][0].url, _HOMEPAGE_URL)
+        self.assertEqual(result["workflow_status"], "running")
+        self.assertTrue(result["crawl_result"].has_usable_content)
+
+    async def test_homepage_preserved_when_selected_pages_is_empty(self) -> None:
+        """Homepage is preserved when selected_pages in state is empty."""
+        from backend.app.agent.nodes.website_crawling_node import website_crawling_node
+
+        hp_page = self._make_homepage_page()
+        state = self._make_state(homepage_scraped_page=hp_page)
+        state["selected_pages"] = []
+
+        result = await website_crawling_node(state)
+
+        self.assertEqual(len(result["scraped_pages"]), 1)
+        self.assertEqual(result["scraped_pages"][0].url, _HOMEPAGE_URL)
+        self.assertEqual(result["workflow_status"], "running")
+        self.assertTrue(result["crawl_result"].has_usable_content)
+
+    async def test_failure_behavior_preserved_when_no_homepage_and_crawling_fails(self) -> None:
+        """Scenario 7: When homepage is absent and crawling fails, workflow fails with 0 scraped pages."""
+        from backend.app.agent.nodes.website_crawling_node import website_crawling_node
+
+        empty_crawl = WebsiteCrawlResult(
+            website_url=_HOMEPAGE_URL,
+            status="failed",
+            scraped_pages=[],
+            failed_pages=[],
+            total_requested=1,
+            total_scraped=0,
+            total_failed=1,
+            has_usable_content=False,
+            error_message="Crawl failed",
+        )
+
+        with patch(
+            "backend.app.agent.nodes.website_crawling_node.crawl_selected_pages",
+            new=AsyncMock(return_value=empty_crawl),
+        ):
+            result = await website_crawling_node(self._make_state(homepage_scraped_page=None))
+
+        self.assertEqual(len(result["scraped_pages"]), 0)
+        self.assertEqual(result["workflow_status"], "failed")
+        self.assertFalse(result["crawl_result"].has_usable_content)
+
+    async def test_duplicate_removal_with_www_and_trailing_slash(self) -> None:
+        """Scenario 6: Duplicate removal handles www, trailing slash, and casing variations."""
+        from backend.app.agent.nodes.website_crawling_node import website_crawling_node
+
+        hp_page = self._make_homepage_page(url="https://example.com")
+        crawled_home = ScrapedPage(
+            url="https://www.example.com/",
+            title="Crawled Home",
+            content="Welcome to Example Company duplicate text here.",
+            page_type=PageType.HOME,
+            status_code=200,
+            metadata={},
+        )
+        crawl_result = _make_crawl_result([crawled_home])
+
+        with patch(
+            "backend.app.agent.nodes.website_crawling_node.crawl_selected_pages",
+            new=AsyncMock(return_value=crawl_result),
+        ):
+            result = await website_crawling_node(self._make_state(homepage_scraped_page=hp_page))
+
+        self.assertEqual(len(result["scraped_pages"]), 1)
+        self.assertEqual(result["scraped_pages"][0].title, "Crawled Home")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Business Overview with Homepage Only
+# ---------------------------------------------------------------------------
+
+class TestBusinessOverviewWithHomepage(unittest.IsolatedAsyncioTestCase):
+    """Tests verifying Business Overview compatibility with homepage content."""
+
+    def _make_business_form(self) -> Any:
+        from backend.app.schemas.business_form import BusinessForm
+        return BusinessForm(
+            business_name_and_description="Example Co makes widgets",
+            product_or_service="widgets",
+            target_audience="businesses",
+            audience_unknown=False,
+            business_website=_HOMEPAGE_URL,
+        )
+
+    async def test_url_discovery_preserves_homepage_with_zero_candidate_urls(self) -> None:
+        """Scenario 1: Homepage succeeds, but URL Discovery finds zero internal-page URLs."""
+        from backend.app.agent.nodes.url_discovery_node import url_discovery_node
+
+        hp = _make_homepage_fetch_result(status="success")
+        discovery_zero_candidates = WebsiteURLDiscoveryResult(
+            requested_url=_HOMEPAGE_URL,
+            base_url=_HOMEPAGE_URL,
+            status="failed",
+            homepage_status="success",
+            homepage_candidate_count=0,
+            candidate_urls=[],
+            total_candidates=0,
+            homepage_fetch_result=hp,
+        )
+
+        with patch(
+            "backend.app.agent.nodes.url_discovery_node.discover_website_urls",
+            new=AsyncMock(return_value=discovery_zero_candidates),
+        ):
+            result = await url_discovery_node({
+                "business_form": self._make_business_form(),
+            })
+
+        self.assertIn("homepage_scraped_page", result)
+        self.assertIsNotNone(result["homepage_scraped_page"])
+        self.assertEqual(result["homepage_scraped_page"].page_type, PageType.HOME)
+        self.assertEqual(result["candidate_urls"], [])
+
+    async def test_business_overview_succeeds_with_homepage_only(self) -> None:
+        """Business Overview node uses homepage content when it is the only page available."""
+        from backend.app.agent.nodes.business_overview_node import business_overview_node
+        from backend.app.services.business_overview_service import (
+            BusinessOverview,
+            BusinessOverviewResult,
+            TargetAudienceInfo,
+        )
+
+        hp_page = ScrapedPage(
+            url=_HOMEPAGE_URL,
+            title="Home",
+            content="Welcome to Example Company. We manufacture world-class industrial widgets " * 10,
+            page_type=PageType.HOME,
+            status_code=200,
+            metadata={},
+        )
+
+        mock_overview = BusinessOverview(
+            business_name="Example Company",
+            website_url=_HOMEPAGE_URL,
+            business_description="Manufacturer of industrial widgets.",
+            target_audience=TargetAudienceInfo(
+                description="Businesses needing widgets",
+                is_explicit=True,
+            ),
+        )
+        mock_result = BusinessOverviewResult(
+            status="success",
+            business_overview=mock_overview,
+            website_url=_HOMEPAGE_URL,
+            total_pages_analyzed=1,
+            total_findings=0,
+            model_used="gpt-4o-mini",
+        )
+
+        with patch(
+            "backend.app.agent.nodes.business_overview_node.generate_business_overview",
+            new=AsyncMock(return_value=mock_result),
+        ) as mock_gen:
+            state = {
+                "business_form": self._make_business_form(),
+                "scraped_pages": [hp_page],
+                "crawl_result": None,
+            }
+            res = await business_overview_node(state)
+
+        self.assertEqual(res["workflow_status"], "completed")
+        self.assertIsNotNone(res["business_overview"])
+        # Ensure generate_business_overview was called with hp_page in crawl_input
+        mock_gen.assert_called_once()
+        call_input = mock_gen.call_args.kwargs.get("crawl_input")
+        self.assertEqual(len(call_input), 1)
+        self.assertEqual(call_input[0].url, _HOMEPAGE_URL)
+
+    async def test_business_overview_fails_when_homepage_content_too_short(self) -> None:
+        """Scenario 8: Homepage content too short (<150 chars) returns insufficient_content."""
+        from backend.app.agent.nodes.business_overview_node import business_overview_node
+        from backend.app.services.business_overview_service import generate_business_overview
+
+        short_hp = ScrapedPage(
+            url=_HOMEPAGE_URL,
+            title="Short",
+            content="Too short.",
+            page_type=PageType.HOME,
+            status_code=200,
+            metadata={},
+        )
+
+        state = {
+            "business_form": self._make_business_form(),
+            "scraped_pages": [short_hp],
+            "crawl_result": None,
+        }
+        res = await business_overview_node(state)
+
+        self.assertEqual(res["workflow_status"], "failed")
+        self.assertEqual(res["overview_result"].status, "insufficient_content")
+        self.assertIsNone(res["business_overview"])
+
+    async def test_business_overview_fails_when_no_usable_content_exists(self) -> None:
+        """Scenario 9: No usable homepage or internal-page content yields failure."""
+        from backend.app.agent.nodes.business_overview_node import business_overview_node
+
+        state = {
+            "business_form": self._make_business_form(),
+            "scraped_pages": [],
+            "crawl_result": None,
+        }
+        res = await business_overview_node(state)
+
+        self.assertEqual(res["workflow_status"], "failed")
+        self.assertEqual(res["overview_result"].status, "insufficient_content")
+        self.assertIsNone(res["business_overview"])
 
 
 if __name__ == "__main__":

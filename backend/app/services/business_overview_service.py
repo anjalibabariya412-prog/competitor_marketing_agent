@@ -21,7 +21,6 @@ Key Responsibilities:
 from __future__ import annotations
 
 import logging
-import re
 import time
 import urllib.parse
 from typing import Any, Literal, Sequence
@@ -43,12 +42,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Operational & Cost Control Limits
 # ---------------------------------------------------------------------------
-
-# Maximum characters allowed per individual page to avoid runaway context
-MAX_PAGE_INPUT_CHARS: int = 6_000
-
-# Total character budget across all pages passed to the LLM prompt (~7,500 tokens)
-MAX_TOTAL_INPUT_CHARS: int = 30_000
 
 # Minimum total characters required across all pages to warrant an LLM generation call
 MIN_TOTAL_CONTENT_CHARS: int = 150
@@ -268,6 +261,32 @@ class BusinessOverviewResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic Tracing Helpers
+# ---------------------------------------------------------------------------
+
+def _diag_check_craze(text: str | None) -> bool:
+    """Diagnostic helper: check if text contains CRAZE product identifier."""
+    if not text:
+        return False
+    lower = text.lower()
+    return "craze" in lower or "ph-lease" in lower
+
+
+def _diag_check_price_269(text: str | None) -> bool:
+    """Diagnostic helper: check if text contains price 269 or ₹269."""
+    if not text:
+        return False
+    return "269" in text or "\u20b9269" in text or "₹269" in text
+
+
+def _diag_check_price_175(text: str | None) -> bool:
+    """Diagnostic helper: check if text contains coupon price 175 or ₹175."""
+    if not text:
+        return False
+    return "175" in text or "\u20b9175" in text or "₹175" in text
+
+
+# ---------------------------------------------------------------------------
 # Helper Functions: Page Extraction & Fair Budget Allocation
 # ---------------------------------------------------------------------------
 
@@ -300,68 +319,13 @@ def _extract_usable_pages(
     return usable_pages, website_url
 
 
-def _allocate_page_budgets(
-    pages: list[ScrapedPage],
-    max_total_chars: int = MAX_TOTAL_INPUT_CHARS,
-    max_page_chars: int = MAX_PAGE_INPUT_CHARS,
-) -> list[tuple[ScrapedPage, int, bool]]:
-    """Deterministically allocate character budgets across usable pages using water-filling.
-
-    Prevents long product/catalog pages from consuming the entire budget and starving
-    subsequent pages (e.g. Pricing, Offers, About, Contact, Policies).
-
-    Returns:
-        list of (page, allocated_chars, is_truncated)
-    """
-    if not pages:
-        return []
-
-    n = len(pages)
-    header_overhead_per_page = 160
-    total_overhead = n * header_overhead_per_page
-    content_budget = max(500, max_total_chars - total_overhead)
-
-    raw_lengths = [len(p.content.strip()) for p in pages]
-    allocations = [0] * n
-    unallocated_budget = content_budget
-    unresolved_indices = set(range(n))
-
-    # Iterative water-filling distribution
-    while unresolved_indices:
-        fair_share = unallocated_budget // len(unresolved_indices)
-        fair_share = min(fair_share, max_page_chars)
-
-        # Pages that fit completely within the fair share
-        satisfied = [i for i in unresolved_indices if raw_lengths[i] <= fair_share]
-        if not satisfied:
-            # All remaining pages require more than fair_share; cap them all at fair_share
-            for i in unresolved_indices:
-                allocations[i] = fair_share
-            break
-
-        for i in satisfied:
-            allocations[i] = raw_lengths[i]
-            unallocated_budget -= raw_lengths[i]
-            unresolved_indices.remove(i)
-
-    results: list[tuple[ScrapedPage, int, bool]] = []
-    for i, page in enumerate(pages):
-        allocated = allocations[i]
-        is_trunc = raw_lengths[i] > allocated
-        results.append((page, allocated, is_trunc))
-
-    return results
-
-
 def _format_pages_for_prompt(
     pages: list[ScrapedPage],
-    max_total_chars: int = MAX_TOTAL_INPUT_CHARS,
-    max_page_chars: int = MAX_PAGE_INPUT_CHARS,
 ) -> tuple[str, list[ScrapedPage]]:
-    """Format and budget page excerpts for the LLM prompt.
+    """Format complete scraped page content for the LLM prompt.
 
-    Ensures that every usable page receives fair representation without exceeding
-    MAX_TOTAL_INPUT_CHARS, using deterministic water-filling budget allocation.
+    Iterates over usable pages with non-empty content and formats each page
+    with its URL, title, page type, and complete un-truncated content.
 
     Returns:
         (formatted_pages_text, included_pages)
@@ -373,31 +337,15 @@ def _format_pages_for_prompt(
     if not usable:
         return "", []
 
-    allocations = _allocate_page_budgets(usable, max_total_chars=max_total_chars, max_page_chars=max_page_chars)
-
     formatted_chunks: list[str] = []
     included_pages: list[ScrapedPage] = []
-    included_records: list[dict[str, Any]] = []
 
-    for idx, (page, allocated, is_truncated) in enumerate(allocations, start=1):
-        if allocated <= 0:
-            continue
-
+    for idx, page in enumerate(usable, start=1):
         title_str = f" | Title: {page.title.strip()}" if page.title and page.title.strip() else ""
         type_str = f" | Type: {page.page_type.value}" if hasattr(page.page_type, "value") else ""
         header = f"--- Page {idx}: {page.url}{title_str}{type_str} ---"
 
         page_text = page.content.strip()
-        if is_truncated:
-            truncated_snippet = page_text[:allocated]
-            if "\n\n" in truncated_snippet[max(0, allocated - 500):]:
-                truncated_snippet = truncated_snippet.rsplit("\n\n", 1)[0]
-            elif "\n" in truncated_snippet[max(0, allocated - 300):]:
-                truncated_snippet = truncated_snippet.rsplit("\n", 1)[0]
-            elif " " in truncated_snippet[max(0, allocated - 150):]:
-                truncated_snippet = truncated_snippet.rsplit(" ", 1)[0]
-            page_text = truncated_snippet.rstrip() + "\n[... Content truncated for input budget ...]"
-
         chunk = f"{header}\n{page_text}\n"
         formatted_chunks.append(chunk)
         included_pages.append(page)
@@ -409,16 +357,22 @@ def _format_pages_for_prompt(
             "allocated_chars": allocated,
             "retained_chars": len(chunk),
             "is_truncated": is_truncated,
+            "has_craze": _diag_check_craze(chunk),
+            "has_269": _diag_check_price_269(chunk),
+            "has_175": _diag_check_price_175(chunk),
         })
 
     final_formatted = "\n".join(formatted_chunks)
 
     logger.info(
-        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars, max=%d).",
+        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars, max=%d). has_craze=%s, has_269=%s, has_175=%s",
         len(included_pages),
         len(pages),
         len(final_formatted),
         max_total_chars,
+        _diag_check_craze(final_formatted),
+        _diag_check_price_269(final_formatted),
+        _diag_check_price_175(final_formatted),
     )
     for rec in included_records:
         status_str = "partially_truncated" if rec["is_truncated"] else "fully_retained"
@@ -494,8 +448,6 @@ def _resolve_and_verify_source_url(
     if not cleaned:
         return None
 
-    is_craze_url = _diag_check_craze(cleaned)
-
     parsed = urllib.parse.urlsplit(cleaned)
     if not parsed.scheme or not parsed.netloc:
         cleaned_joined = urllib.parse.urljoin(base_website_url, cleaned)
@@ -504,8 +456,6 @@ def _resolve_and_verify_source_url(
         cleaned_joined = cleaned
 
     if parsed.scheme.lower() not in ("http", "https"):
-        if is_craze_url:
-            logger.warning("[business_overview_trace] CRAZE source URL '%s' rejected: invalid scheme", cleaned)
         return None
 
     base_host = urllib.parse.urlsplit(base_website_url).netloc.lower()
@@ -523,11 +473,6 @@ def _resolve_and_verify_source_url(
         and not clean_cited_host.endswith("." + clean_base_host)
         and not clean_base_host.endswith("." + clean_cited_host)
     ):
-        if is_craze_url:
-            logger.warning(
-                "[business_overview_trace] CRAZE source URL '%s' rejected: external domain (%s vs %s)",
-                cleaned, clean_cited_host, clean_base_host
-            )
         return None
 
     # 1. Direct normalized lookup
@@ -554,83 +499,7 @@ def _resolve_and_verify_source_url(
         if slug in path_to_original:
             return path_to_original[slug]
 
-    if is_craze_url:
-        logger.warning(
-            "[business_overview_trace] CRAZE source URL '%s' rejected: un-crawled/unmatched (norm='%s')",
-            cleaned, norm
-        )
     return None
-
-
-# ---------------------------------------------------------------------------
-# Customer-Facing Language Sanitization Rules
-# ---------------------------------------------------------------------------
-
-CUSTOMER_FACING_REPLACEMENT_RULES: tuple[tuple[re.Pattern, str], ...] = (
-    # Compound phrases with excerpts
-    (re.compile(r'\b(the\s+)?(?:crawled|supplied|scraped|provided)\s+(?:page|content)\s+excerpts?\b', re.IGNORECASE), r'\1reviewed page content'),
-    (re.compile(r'\b(the\s+)?(?:page|content)\s+excerpts?\b', re.IGNORECASE), r'\1reviewed page content'),
-
-    # Supplied product pages / pages / content / text / website
-    (re.compile(r'\b(the\s+)?supplied\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
-    (re.compile(r'\b(the\s+)?supplied\s+website\s+(content|text)\b', re.IGNORECASE), r'\1website \2'),
-    (re.compile(r'\b(the\s+)?supplied\s+(content|text|data|materials?)\b', re.IGNORECASE), r'\1reviewed \2'),
-    (re.compile(r'\b(the\s+)?supplied\s+website\b', re.IGNORECASE), r'\1website'),
-
-    # Crawled pages / collections / content / text / website
-    (re.compile(r'\b(the\s+)?crawled\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?|collections?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
-    (re.compile(r'\b(the\s+)?crawled\s+website\s+(content|text)\b', re.IGNORECASE), r'\1website \2'),
-    (re.compile(r'\b(the\s+)?crawled\s+(content|text|data|materials?)\b', re.IGNORECASE), r'\1reviewed \2'),
-    (re.compile(r'\b(the\s+)?crawled\s+website\b', re.IGNORECASE), r'\1website'),
-
-    # Scraped pages / content / text / website
-    (re.compile(r'\b(the\s+)?scraped\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
-    (re.compile(r'\b(the\s+)?scraped\s+(content|text|data|materials?|website)\b', re.IGNORECASE), r'\1reviewed \2'),
-
-    # Provided website text / provided content / provided pages
-    (re.compile(r'\b(the\s+)?provided\s+website\s+text\b', re.IGNORECASE), r'\1website text'),
-    (re.compile(r'\b(the\s+)?provided\s+(content|text|data|materials?)\b', re.IGNORECASE), r'\1reviewed \2'),
-    (re.compile(r'\b(the\s+)?provided\s+((?:[a-zA-Z0-9_\-]+\s+)*)(pages?|product\s+pages?)\b', re.IGNORECASE), r'\1reviewed \2\3'),
-
-    # Content / pages we analyzed / crawled / scraped
-    (re.compile(r'\b(the\s+)?content\s+we\s+analyzed\b', re.IGNORECASE), r'\1reviewed content'),
-    (re.compile(r'\b(the\s+)?pages\s+we\s+(?:analyzed|crawled|scraped)\b', re.IGNORECASE), r'\1reviewed pages'),
-
-    # Internal crawler/scraper agent actions
-    (re.compile(r'\b(?:reported|identified|found)\s+by\s+the\s+(?:crawler|scraper)\b', re.IGNORECASE), 'found on the reviewed pages'),
-    (re.compile(r'\bthe\s+(?:crawler|scraper)\s+(?:did\s+not\s+find|could\s+not\s+find)\b', re.IGNORECASE), 'the reviewed pages did not show'),
-    (re.compile(r'\bthe\s+(?:crawler|scraper)\s+reports?\b', re.IGNORECASE), 'the reviewed pages indicate'),
-)
-
-
-def _case_adaptive_sub(pattern: re.Pattern, template: str, text: str) -> str:
-    """Substitute pattern matches while preserving all-caps or title-case capitalization."""
-    def replacer(match: re.Match) -> str:
-        orig = match.group(0)
-        sub = match.expand(template)
-        if orig.isupper():
-            return sub.upper()
-        if orig and orig[0].isupper():
-            return sub[0].upper() + sub[1:]
-        return sub
-
-    return pattern.sub(replacer, text)
-
-
-def sanitize_customer_facing_text(text: str) -> str:
-    """Sanitize customer-facing descriptive strings to remove internal crawling and processing jargon.
-
-    Preserves exact pricing, variant, URL, and audience evidence without hallucinating
-    or converting meaningful uncertainty into definitive claims.
-    """
-    if not text or not isinstance(text, str):
-        return text
-
-    sanitized = text
-    for pattern, template in CUSTOMER_FACING_REPLACEMENT_RULES:
-        sanitized = _case_adaptive_sub(pattern, template, sanitized)
-
-    return sanitized
 
 
 def _sanitize_and_validate_overview(
@@ -835,33 +704,6 @@ def _sanitize_and_validate_overview(
         if not overview.business_description or overview.business_description.strip() in ("", "unknown"):
             overview.business_description = stated_name_desc
 
-    # 7. Customer-Facing Language Sanitization (removes internal crawling/processing jargon)
-    overview.business_description = sanitize_customer_facing_text(overview.business_description)
-    overview.conflicts = [sanitize_customer_facing_text(c) for c in overview.conflicts]
-
-    for gap in overview.information_gaps:
-        gap.observation = sanitize_customer_facing_text(gap.observation)
-        gap.category = sanitize_customer_facing_text(gap.category)
-
-    for vp in overview.positioning_and_value_propositions:
-        vp.statement = sanitize_customer_facing_text(vp.statement)
-
-    if overview.target_audience and overview.target_audience.description:
-        overview.target_audience.description = sanitize_customer_facing_text(overview.target_audience.description)
-
-    for p in overview.products_and_services:
-        p.description = sanitize_customer_facing_text(p.description)
-        p.features = [sanitize_customer_facing_text(f) for f in p.features]
-        p.benefits = [sanitize_customer_facing_text(b) for b in p.benefits]
-        if p.pricing:
-            if p.pricing.discount_text:
-                p.pricing.discount_text = sanitize_customer_facing_text(p.pricing.discount_text)
-            if p.pricing.trial_or_guarantee:
-                p.pricing.trial_or_guarantee = sanitize_customer_facing_text(p.pricing.trial_or_guarantee)
-
-    for finding in overview.key_findings:
-        finding.statement = sanitize_customer_facing_text(finding.statement)
-
     logger.info(
         "[business_overview_trace] [CHECKPOINT 5: sanitization] Sanitization complete: %d findings verified, %d dropped. %d verified sources in sources_used, %d conflicts detected.",
         len(overview.key_findings),
@@ -975,7 +817,7 @@ async def generate_business_overview(
             error_message=err,
         )
 
-    # 5. Build prompt with water-filling bounded excerpts and user intake context
+    # 5. Build prompt with complete page content and user intake context
     stated_name_desc = ""
     stated_product = ""
     stated_audience = ""

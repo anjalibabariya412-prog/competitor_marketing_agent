@@ -27,16 +27,9 @@ from backend.app.services.sitemap_fallback_service import (
     discover_website_urls,
 )
 from backend.app.services.url_extractor_service import CandidateURL
-from backend.app.services.website_content_crawler_service import (
-    MIN_PAGE_CONTENT_CHARS,
-    _extract_text_from_html,
-)
+from backend.app.services.website_content_crawler_service import _extract_text_from_html
 
 logger = logging.getLogger(__name__)
-
-# Limit homepage text to match the per-page cap used by business_overview_service
-# (MAX_PAGE_INPUT_CHARS = 6000) so the homepage does not drown out other pages.
-_HOMEPAGE_MAX_CHARS: int = 6_000
 
 
 def _homepage_html_to_scraped_page(
@@ -47,10 +40,10 @@ def _homepage_html_to_scraped_page(
     Returns ``None`` when:
     - The fetch status is not ``"success"``.
     - The HTML is missing or empty.
-    - The extracted text is shorter than ``MIN_PAGE_CONTENT_CHARS`` (too sparse to be useful).
+    - The extracted text is genuinely empty after stripping whitespace.
 
-    The extracted text is capped at ``_HOMEPAGE_MAX_CHARS`` characters to avoid
-    crowding out other pages when passed to the Business Overview LLM.
+    All non-empty extracted text is preserved in full — no minimum-length
+    threshold is applied and no upper character limit is enforced.
     """
     if homepage_fetch_result.status != "success":
         return None
@@ -61,17 +54,8 @@ def _homepage_html_to_scraped_page(
 
     text = _extract_text_from_html(html).strip()
 
-    if len(text) < MIN_PAGE_CONTENT_CHARS:
-        logger.debug(
-            "Homepage text too short (%d chars < %d min); skipping ScrapedPage conversion.",
-            len(text),
-            MIN_PAGE_CONTENT_CHARS,
-        )
+    if not text:
         return None
-
-    # Cap text to avoid overshadowing other pages in the LLM context
-    if len(text) > _HOMEPAGE_MAX_CHARS:
-        text = text[:_HOMEPAGE_MAX_CHARS].rsplit("\n", 1)[0].strip()
 
     page_url = homepage_fetch_result.final_url or homepage_fetch_result.requested_url
 
@@ -178,34 +162,15 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
         return {
             "discovery_result": failed_result,
             "candidate_urls": [],
+            "homepage_scraped_page": None,
             "current_step": "url_discovery",
             "workflow_status": "failed",
             "error_message": error_msg,
             "errors": existing_errors,
         }
 
-    # 4. Check for discovery failure or 0 discovered candidates
-    if discovery_result.status == "failed" or not discovery_result.candidate_urls:
-        error_msg = (
-            f"URL discovery yielded 0 candidate URLs for '{clean_url}' "
-            f"(homepage status: '{discovery_result.homepage_status}', "
-            f"sitemap status: '{discovery_result.sitemap_status}')."
-        )
-        logger.warning("URL Discovery Node failure: %s", error_msg)
-        existing_errors = list(state.get("errors") or [])
-        existing_errors.append(error_msg)
-        return {
-            "discovery_result": discovery_result,
-            "candidate_urls": [],
-            "current_step": "url_discovery",
-            "workflow_status": "failed",
-            "error_message": error_msg,
-            "errors": existing_errors,
-        }
-
-    # 5. Successful or partial discovery with usable candidate URLs.
-    # Convert the homepage HTML (already fetched inside discover_website_urls) into a
-    # ScrapedPage so the Website Crawling node can include it without a second fetch.
+    # Convert homepage HTML (fetched inside discover_website_urls) into a ScrapedPage
+    # regardless of whether any internal candidate URLs were discovered.
     homepage_scraped_page: ScrapedPage | None = None
     hp_fetch_result = getattr(discovery_result, "homepage_fetch_result", None)
     if hp_fetch_result is not None:
@@ -234,6 +199,27 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
             )
             homepage_scraped_page = None
 
+    # 4. Check for discovery failure or 0 discovered candidates
+    if discovery_result.status == "failed" or not discovery_result.candidate_urls:
+        error_msg = (
+            f"URL discovery yielded 0 candidate URLs for '{clean_url}' "
+            f"(homepage status: '{discovery_result.homepage_status}', "
+            f"sitemap status: '{discovery_result.sitemap_status}')."
+        )
+        logger.warning("URL Discovery Node failure: %s", error_msg)
+        existing_errors = list(state.get("errors") or [])
+        existing_errors.append(error_msg)
+        return {
+            "discovery_result": discovery_result,
+            "candidate_urls": [],
+            "homepage_scraped_page": homepage_scraped_page,
+            "current_step": "url_discovery",
+            "workflow_status": "failed",
+            "error_message": error_msg,
+            "errors": existing_errors,
+        }
+
+    # 5. Successful or partial discovery with usable candidate URLs
     logger.info(
         "URL Discovery Node completed successfully for '%s': %d candidate URLs discovered "
         "(status: '%s', homepage: '%s', sitemap triggered: %s).",

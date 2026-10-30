@@ -27,6 +27,39 @@ from backend.app.services.website_content_crawler_service import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_url_for_merge(url: str) -> str:
+    """Normalize URL for deduplication when merging homepage into scraped pages."""
+    cleaned = url.strip().lower().rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(cleaned)
+        netloc = parsed.netloc
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = parsed.path.rstrip("/")
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, path, parsed.query, ""))
+    except Exception:
+        return cleaned
+
+
+def _merge_homepage_into_scraped_pages(
+    homepage_scraped_page: ScrapedPage | None,
+    scraped_pages: list[ScrapedPage],
+) -> list[ScrapedPage]:
+    """Prepend homepage_scraped_page to scraped_pages if usable and not already present."""
+    if homepage_scraped_page is None:
+        return list(scraped_pages)
+
+    if not homepage_scraped_page.content or not homepage_scraped_page.content.strip():
+        return list(scraped_pages)
+
+    crawled_urls_normalized = {_normalize_url_for_merge(p.url) for p in scraped_pages}
+    hp_url_normalized = _normalize_url_for_merge(homepage_scraped_page.url)
+
+    if hp_url_normalized not in crawled_urls_normalized:
+        return [homepage_scraped_page] + list(scraped_pages)
+    return list(scraped_pages)
+
+
 async def website_crawling_node(state: AgentState) -> dict[str, Any]:
     """Execute the Website Crawling stage of the Competitor Marketing Agent workflow.
 
@@ -101,6 +134,7 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
             website_url = f"{parsed.scheme}://{parsed.netloc}"
 
     clean_url = website_url.strip() if website_url else ""
+    homepage_scraped_page: ScrapedPage | None = state.get("homepage_scraped_page")  # type: ignore[assignment]
 
     # Handle missing or empty selected_pages
     if not cleaned_selected_pages:
@@ -109,23 +143,42 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
             "No selected pages available to crawl."
         )
         logger.warning(error_msg)
+        final_scraped_pages = _merge_homepage_into_scraped_pages(homepage_scraped_page, [])
         failed_result = WebsiteCrawlResult(
             website_url=clean_url or "unknown",
             status="empty",
-            scraped_pages=[],
+            scraped_pages=final_scraped_pages,
             failed_pages=[],
             total_requested=0,
-            total_scraped=0,
+            total_scraped=len(final_scraped_pages),
             total_failed=0,
-            has_usable_content=False,
+            has_usable_content=bool(final_scraped_pages),
             error_message="Website Crawling Node received 0 selected pages.",
         )
         existing_errors = list(state.get("errors") or [])
         existing_errors.append(error_msg)
+
+        if final_scraped_pages:
+            logger.info(
+                "Preserving homepage (%d chars) despite 0 selected pages for '%s'.",
+                len(final_scraped_pages[0].content),
+                clean_url,
+            )
+            return {
+                "crawl_result": failed_result,
+                "scraped_pages": final_scraped_pages,
+                "failed_pages": [],
+                "homepage_scraped_page": homepage_scraped_page,
+                "current_step": "website_crawling",
+                "workflow_status": "running",
+                "errors": existing_errors,
+            }
+
         return {
             "crawl_result": failed_result,
             "scraped_pages": [],
             "failed_pages": [],
+            "homepage_scraped_page": None,
             "current_step": "website_crawling",
             "workflow_status": "failed",
             "error_message": error_msg,
@@ -147,33 +200,57 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("Unexpected exception in website content crawler for '%s': %s", clean_url, exc)
         error_msg = f"Website crawling failed unexpectedly for '{clean_url}': {exc}"
+        final_scraped_pages = _merge_homepage_into_scraped_pages(homepage_scraped_page, [])
         failed_result = WebsiteCrawlResult(
             website_url=clean_url or "unknown",
             status="failed",
-            scraped_pages=[],
+            scraped_pages=final_scraped_pages,
             failed_pages=[
                 FailedPageScrape(url=p.url, error_message=error_msg, page_type=p.page_type)
                 for p in cleaned_selected_pages
             ],
             total_requested=len(cleaned_selected_pages),
-            total_scraped=0,
+            total_scraped=len(final_scraped_pages),
             total_failed=len(cleaned_selected_pages),
-            has_usable_content=False,
+            has_usable_content=bool(final_scraped_pages),
             error_message=error_msg,
         )
         existing_errors = list(state.get("errors") or [])
         existing_errors.append(error_msg)
+
+        if final_scraped_pages:
+            logger.info(
+                "Preserving homepage (%d chars) despite crawling exception for '%s'.",
+                len(final_scraped_pages[0].content),
+                clean_url,
+            )
+            return {
+                "crawl_result": failed_result,
+                "scraped_pages": final_scraped_pages,
+                "failed_pages": failed_result.failed_pages,
+                "homepage_scraped_page": homepage_scraped_page,
+                "current_step": "website_crawling",
+                "workflow_status": "running",
+                "errors": existing_errors,
+            }
+
         return {
             "crawl_result": failed_result,
             "scraped_pages": [],
             "failed_pages": failed_result.failed_pages,
+            "homepage_scraped_page": None,
             "current_step": "website_crawling",
             "workflow_status": "failed",
             "error_message": error_msg,
             "errors": existing_errors,
         }
 
-    # 5. Handle complete crawl failure (0 scraped pages or no usable content)
+    # 5. Handle complete internal crawl failure (0 scraped pages or no usable content)
+    final_scraped_pages = _merge_homepage_into_scraped_pages(
+        homepage_scraped_page,
+        crawl_result.scraped_pages,
+    )
+
     if not crawl_result.has_usable_content or crawl_result.total_scraped == 0 or crawl_result.status in ("failed", "empty"):
         if getattr(crawl_result, "actor_status", None) == "TIMED-OUT":
             error_msg = (
@@ -190,13 +267,35 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
                 f"Website crawling yielded 0 usable pages for '{clean_url}': "
                 f"{crawl_result.error_message or 'All requested pages failed during scraping.'}"
             )
-        logger.warning("Website Crawling Node failure: %s", error_msg)
+        logger.warning("Website Crawling Node: internal crawl produced no usable content: %s", error_msg)
         existing_errors = list(state.get("errors") or [])
         existing_errors.append(error_msg)
+
+        if final_scraped_pages:
+            logger.info(
+                "Preserving homepage (%d chars) despite complete internal crawling failure for '%s'.",
+                len(final_scraped_pages[0].content),
+                clean_url,
+            )
+            crawl_result.scraped_pages = final_scraped_pages
+            crawl_result.has_usable_content = True
+            crawl_result.total_scraped = len(final_scraped_pages)
+
+            return {
+                "crawl_result": crawl_result,
+                "scraped_pages": final_scraped_pages,
+                "failed_pages": crawl_result.failed_pages,
+                "homepage_scraped_page": homepage_scraped_page,
+                "current_step": "website_crawling",
+                "workflow_status": "running",
+                "errors": existing_errors,
+            }
+
         return {
             "crawl_result": crawl_result,
             "scraped_pages": [],
             "failed_pages": crawl_result.failed_pages,
+            "homepage_scraped_page": None,
             "current_step": "website_crawling",
             "workflow_status": "failed",
             "error_message": error_msg,
@@ -204,39 +303,17 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
         }
 
     # 6. Successful or partial crawl with usable content.
-    # Merge homepage_scraped_page (captured during URL Discovery) into scraped_pages,
-    # placing it first and deduplicating by normalized URL so the homepage is never
-    # counted twice if the Apify crawler also happened to return it.
-    homepage_scraped_page: ScrapedPage | None = state.get("homepage_scraped_page")  # type: ignore[assignment]
-    final_scraped_pages: list[ScrapedPage] = list(crawl_result.scraped_pages)
-
-    if homepage_scraped_page is not None:
-        # Normalize URLs for comparison: strip trailing slash, ignore scheme case
-        crawled_urls_normalized = {p.url.rstrip("/").lower() for p in final_scraped_pages}
-        hp_url_normalized = homepage_scraped_page.url.rstrip("/").lower()
-        if hp_url_normalized not in crawled_urls_normalized:
-            final_scraped_pages = [homepage_scraped_page] + final_scraped_pages
-            logger.info(
-                "Homepage ScrapedPage ('%s', %d chars) merged into scraped_pages. "
-                "Total pages now: %d.",
-                homepage_scraped_page.url,
-                len(homepage_scraped_page.content),
-                len(final_scraped_pages),
-            )
-        else:
-            logger.debug(
-                "Homepage URL '%s' already present in crawled pages; skipping merge.",
-                homepage_scraped_page.url,
-            )
-
     logger.info(
         "Website Crawling Node completed for '%s': status='%s', scraped=%d/%d, failed=%d.",
         clean_url,
         crawl_result.status,
-        crawl_result.total_scraped,
+        len(final_scraped_pages),
         crawl_result.total_requested,
         crawl_result.total_failed,
     )
+
+    crawl_result.scraped_pages = final_scraped_pages
+    crawl_result.total_scraped = len(final_scraped_pages)
 
     update: dict[str, Any] = {
         "crawl_result": crawl_result,
