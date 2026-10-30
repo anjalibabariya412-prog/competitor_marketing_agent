@@ -268,32 +268,6 @@ class BusinessOverviewResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic Tracing Helpers
-# ---------------------------------------------------------------------------
-
-def _diag_check_craze(text: str | None) -> bool:
-    """Diagnostic helper: check if text contains CRAZE product identifier."""
-    if not text:
-        return False
-    lower = text.lower()
-    return "craze" in lower or "ph-lease" in lower
-
-
-def _diag_check_price_269(text: str | None) -> bool:
-    """Diagnostic helper: check if text contains price 269 or ₹269."""
-    if not text:
-        return False
-    return "269" in text or "\u20b9269" in text or "₹269" in text
-
-
-def _diag_check_price_175(text: str | None) -> bool:
-    """Diagnostic helper: check if text contains coupon price 175 or ₹175."""
-    if not text:
-        return False
-    return "175" in text or "\u20b9175" in text or "₹175" in text
-
-
-# ---------------------------------------------------------------------------
 # Helper Functions: Page Extraction & Fair Budget Allocation
 # ---------------------------------------------------------------------------
 
@@ -435,22 +409,16 @@ def _format_pages_for_prompt(
             "allocated_chars": allocated,
             "retained_chars": len(chunk),
             "is_truncated": is_truncated,
-            "has_craze": _diag_check_craze(chunk),
-            "has_269": _diag_check_price_269(chunk),
-            "has_175": _diag_check_price_175(chunk),
         })
 
     final_formatted = "\n".join(formatted_chunks)
 
     logger.info(
-        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars, max=%d). has_craze=%s, has_269=%s, has_175=%s",
+        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars, max=%d).",
         len(included_pages),
         len(pages),
         len(final_formatted),
         max_total_chars,
-        _diag_check_craze(final_formatted),
-        _diag_check_price_269(final_formatted),
-        _diag_check_price_175(final_formatted),
     )
     for rec in included_records:
         status_str = "partially_truncated" if rec["is_truncated"] else "fully_retained"
