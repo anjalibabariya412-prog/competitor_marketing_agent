@@ -217,7 +217,7 @@ class BusinessOverview(BaseModel):
     )
     key_findings: list[Finding] = Field(
         default_factory=list,
-        description="Granular findings categorized by FindingType, tracking statements, inferences, and source URLs.",
+        description="Significant additional business-level observations (business model, distribution approach, commercial patterns, customer policies) not covered in other sections.",
     )
     sources_used: list[str] = Field(
         default_factory=list,
@@ -559,10 +559,35 @@ def _sanitize_and_validate_overview(
     if verified_audience_source is None and overview.target_audience.is_explicit:
         overview.target_audience.is_explicit = False
 
-    # 4. Sanitize key findings (remove findings citing un-crawled/unverified URLs)
+    # 4. Sanitize key findings (remove duplicates, findings duplicating other sections, and unverified URLs)
     verified_findings: list[Finding] = []
     dropped_findings_count = 0
+    seen_finding_statements: set[str] = set()
+
+    # Pre-collect normalized statements from other sections for cross-section deduplication
+    existing_statements: set[str] = set()
+    if overview.business_description:
+        existing_statements.add(" ".join(overview.business_description.strip().lower().split()))
+    for vp in overview.positioning_and_value_propositions:
+        if vp.statement:
+            existing_statements.add(" ".join(vp.statement.strip().lower().split()))
+
     for finding in overview.key_findings:
+        statement_clean = finding.statement.strip()
+        statement_norm = " ".join(statement_clean.lower().split())
+
+        # Drop exact duplicate findings within key_findings
+        if statement_norm in seen_finding_statements:
+            dropped_findings_count += 1
+            logger.info("Dropping duplicate finding statement: '%s'", statement_clean[:60])
+            continue
+
+        # Drop finding if it directly duplicates a value proposition or the business description
+        if statement_norm in existing_statements:
+            dropped_findings_count += 1
+            logger.info("Dropping finding that duplicates existing section statement: '%s'", statement_clean[:60])
+            continue
+
         verified_finding_sources: list[str] = []
         if hasattr(finding, "source_urls") and finding.source_urls:
             for s_url in finding.source_urls:
@@ -579,6 +604,7 @@ def _sanitize_and_validate_overview(
         if verified_finding_sources:
             finding.source_urls = verified_finding_sources
             finding.source_url = verified_finding_sources[0]
+            seen_finding_statements.add(statement_norm)
             verified_findings.append(finding)
         else:
             dropped_findings_count += 1

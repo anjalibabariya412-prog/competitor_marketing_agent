@@ -300,7 +300,7 @@ export function Screen2Overview({ rawResponse, onBack }) {
           <div className="panel-title-bar">
             <div>
               <h2 className="panel-heading">Key Findings</h2>
-              <p className="panel-subheading">Significant observations about the business's products, offers, audience, and messaging.</p>
+              <p className="panel-subheading">Significant additional business-level observations not covered in the sections above.</p>
             </div>
           </div>
 
