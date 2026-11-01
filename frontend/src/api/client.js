@@ -3,8 +3,6 @@
  * All outbound requests route through here with typed signatures and clean error handling.
  */
 
-import { findCompetitorsMock, submitCompetitorsForAnalysisMock } from './mocks.js';
-
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
 
 /**
@@ -62,23 +60,5 @@ export async function fetchBusinessOverview(payload, signal) {
 
   const data = await response.json();
   return data;
-}
-
-/**
- * Discovers candidate competitors autonomously.
- * Uses mock service until real endpoint is available.
- * TODO: Replace findCompetitorsMock with real backend endpoint POST /api/v1/competitors/discover
- */
-export async function discoverCompetitors(params, signal) {
-  return findCompetitorsMock(params, signal);
-}
-
-/**
- * Submits the confirmed competitor list for comparative report synthesis.
- * Uses mock service until real endpoint is available.
- * TODO: Replace submitCompetitorsForAnalysisMock with real backend endpoint POST /api/v1/competitor-analysis
- */
-export async function analyzeCompetitors(params, signal) {
-  return submitCompetitorsForAnalysisMock(params, signal);
 }
 

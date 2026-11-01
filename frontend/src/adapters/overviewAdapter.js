@@ -61,7 +61,10 @@ export function adaptBusinessOverview(rawResponse) {
 
   // Sources and page count
   const sourcesUsed = Array.isArray(overview.sources_used) ? overview.sources_used.filter(Boolean) : [];
-  const pageCount = sourcesUsed.length || (rawResponse.total_pages_analyzed || 0);
+  const totalPagesAnalyzed = (typeof rawResponse?.total_pages_analyzed === 'number' && rawResponse.total_pages_analyzed > 0)
+    ? rawResponse.total_pages_analyzed
+    : null;
+  const pageCount = totalPagesAnalyzed ?? (sourcesUsed.length || 0);
 
   // 1. What you offer (Product cards)
   let rawOfferings = overview.products_and_services;
@@ -181,6 +184,7 @@ export function adaptBusinessOverview(rawResponse) {
     websiteUrl,
     businessDescription,
     pageCount,
+    totalPagesAnalyzed,
     executionTimeSeconds: rawResponse.execution_time_seconds ?? null,
     products,
     audience,

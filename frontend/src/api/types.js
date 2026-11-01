@@ -74,24 +74,9 @@
  * @property {string} status
  * @property {RawBusinessOverview} business_overview
  * @property {string} website_url
+ * @property {number} [total_pages_analyzed]
  * @property {number} [execution_time_seconds]
  */
 
-/**
- * @typedef {Object} CompetitorCandidate
- * @property {string} id
- * @property {string} name
- * @property {string} website
- * @property {string} reason
- * @property {string|null} [social_link]
- */
-
-/**
- * @typedef {Object} CompetitorAnalysisReport
- * @property {string} status
- * @property {string} business_name
- * @property {string[]} competitors
- * @property {Object} sections
- */
 export {};
 

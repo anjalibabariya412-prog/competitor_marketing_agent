@@ -1,7 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { adaptBusinessOverview } from '../../adapters/overviewAdapter.js';
 import {
-  ArrowRightIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronUpIcon,
@@ -29,7 +28,7 @@ function getCategoryIcon(item = {}) {
   return PackageIcon;
 }
 
-export function Screen2Overview({ rawResponse, onBack, onContinue }) {
+export function Screen2Overview({ rawResponse, onBack }) {
   const [sourcesExpanded, setSourcesExpanded] = useState(false);
   const data = adaptBusinessOverview(rawResponse);
 
@@ -55,6 +54,7 @@ export function Screen2Overview({ rawResponse, onBack, onContinue }) {
     findings,
     sourcesUsed,
     pageCount,
+    totalPagesAnalyzed,
   } = data;
 
   const keySources = useMemo(() => {
@@ -131,9 +131,13 @@ export function Screen2Overview({ rawResponse, onBack, onContinue }) {
   }, [sourcesUsed, audience, positioning, findings, products, rawResponse]);
 
   const actualPageCount =
-    (typeof pageCount === 'number' && pageCount > 0)
-      ? pageCount
-      : (keySources.length > 0 ? keySources.length : (rawResponse?.total_pages_analyzed || 0));
+    (typeof totalPagesAnalyzed === 'number' && totalPagesAnalyzed > 0)
+      ? totalPagesAnalyzed
+      : (typeof rawResponse?.total_pages_analyzed === 'number' && rawResponse.total_pages_analyzed > 0)
+        ? rawResponse.total_pages_analyzed
+        : (typeof pageCount === 'number' && pageCount > 0)
+          ? pageCount
+          : (keySources.length > 0 ? keySources.length : 0);
 
   return (
     <div className="overview-page-wrapper">
@@ -239,7 +243,59 @@ export function Screen2Overview({ rawResponse, onBack, onContinue }) {
           )}
         </section>
 
-        {/* Section 3: Key Findings */}
+        {/* Section 3: How You Position Yourself */}
+        <section className="overview-report-section">
+          <div className="panel-title-bar">
+            <div>
+              <h2 className="panel-heading">How You Position Yourself</h2>
+              <p className="panel-subheading">Key positioning claims, value propositions, and market differentiators.</p>
+            </div>
+          </div>
+
+          {positioning && positioning.length > 0 ? (
+            <div className="numbered-items-stack">
+              {positioning.map((item, idx) => (
+                <div key={item.id || idx} className="numbered-item-row">
+                  <span className="bullet-indicator" aria-hidden="true" />
+                  <div className="numbered-item-content">
+                    <p className="numbered-item-text">{item.statement}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-panel-text">No distinct positioning claims identified.</p>
+          )}
+        </section>
+
+        {/* Section 4: Target Audience */}
+        <section className="overview-report-section">
+          <div className="panel-title-bar">
+            <div>
+              <h2 className="panel-heading">Target Audience</h2>
+              <p className="panel-subheading">Target customer segments, demographics, and buyer personas.</p>
+            </div>
+          </div>
+
+          <div className="audience-info-card">
+            <div className="audience-icon-badge" aria-hidden="true">
+              <UsersIcon size="md" />
+            </div>
+            <div className="audience-content-wrap">
+              <p className="audience-lead-text">
+                {audience?.description || 'Target customer profile derived from your business offerings and website messaging.'}
+              </p>
+              {audience?.provenance?.hasConflict && (
+                <div className="conflict-notice-pill">
+                  <ShieldAlertIcon size="sm" />
+                  <span>Conflicting audience information detected on site</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* Section 5: Key Findings */}
         <section className="overview-report-section">
           <div className="panel-title-bar">
             <div>
@@ -268,58 +324,6 @@ export function Screen2Overview({ rawResponse, onBack, onContinue }) {
           ) : (
             <p className="empty-panel-text">No additional findings reported.</p>
           )}
-        </section>
-
-        {/* Section 4: How You Position Yourself */}
-        <section className="overview-report-section">
-          <div className="panel-title-bar">
-            <div>
-              <h2 className="panel-heading">How You Position Yourself</h2>
-              <p className="panel-subheading">Key positioning claims, value propositions, and market differentiators.</p>
-            </div>
-          </div>
-
-          {positioning && positioning.length > 0 ? (
-            <div className="numbered-items-stack">
-              {positioning.map((item, idx) => (
-                <div key={item.id || idx} className="numbered-item-row">
-                  <span className="bullet-indicator" aria-hidden="true" />
-                  <div className="numbered-item-content">
-                    <p className="numbered-item-text">{item.statement}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="empty-panel-text">No distinct positioning claims identified.</p>
-          )}
-        </section>
-
-        {/* Section 5: Target Audience */}
-        <section className="overview-report-section">
-          <div className="panel-title-bar">
-            <div>
-              <h2 className="panel-heading">Target Audience</h2>
-              <p className="panel-subheading">Target customer segments, demographics, and buyer personas.</p>
-            </div>
-          </div>
-
-          <div className="audience-info-card">
-            <div className="audience-icon-badge" aria-hidden="true">
-              <UsersIcon size="md" />
-            </div>
-            <div className="audience-content-wrap">
-              <p className="audience-lead-text">
-                {audience?.description || 'Target customer profile derived from your business offerings and website messaging.'}
-              </p>
-              {audience?.provenance?.hasConflict && (
-                <div className="conflict-notice-pill">
-                  <ShieldAlertIcon size="sm" />
-                  <span>Conflicting audience information detected on site</span>
-                </div>
-              )}
-            </div>
-          </div>
         </section>
 
         {/* 6. Collapsible Key Sources Row */}
@@ -357,14 +361,6 @@ export function Screen2Overview({ rawResponse, onBack, onContinue }) {
             )}
           </div>
         )}
-      </div>
-
-      {/* 3. Sticky Bottom Action Dock */}
-      <div className="overview-bottom-action-dock">
-        <button type="button" onClick={onContinue} className="btn-primary-action">
-          <span>Continue</span>
-          <ArrowRightIcon size="md" />
-        </button>
       </div>
     </div>
   );

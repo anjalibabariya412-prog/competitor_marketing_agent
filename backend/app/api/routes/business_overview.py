@@ -184,5 +184,6 @@ async def generate_business_overview_endpoint(
         status="success",
         business_overview=business_overview,
         website_url=target_url,
+        total_pages_analyzed=metadata.total_pages_analyzed,
         execution_time_seconds=metadata.execution_time_seconds,
     )

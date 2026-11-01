@@ -54,6 +54,10 @@ class BusinessOverviewResponse(BaseModel):
     website_url: str = Field(
         description="Primary business website URL analyzed.",
     )
+    total_pages_analyzed: int = Field(
+        default=0,
+        description="Total scraped pages with readable text submitted to LLM synthesis.",
+    )
     execution_time_seconds: float = Field(
         default=0.0,
         description="Duration of overview generation in seconds.",
