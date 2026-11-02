@@ -59,9 +59,10 @@ test('loadSessionState clears form fields even if sessionStorage has prior form 
   assert.equal(refreshedSession.theme, 'dark');
 });
 
-test('saveSessionState omits form data from sessionStorage', () => {
+test('saveSessionState omits form data and overview state from sessionStorage', () => {
   const activeSession = {
-    currentStep: 1,
+    currentStep: 2,
+    overviewResponse: { status: 'success', business_overview: { business_name: 'Test Corp' } },
     formData: {
       business_name_and_description: 'Live active form typing',
       product_or_service: 'Live product',
@@ -78,8 +79,25 @@ test('saveSessionState omits form data from sessionStorage', () => {
   assert.ok(storedRaw);
   const storedParsed = JSON.parse(storedRaw);
 
-  // Stored formData must be empty
+  // Stored formData must be empty and step must reset to 1
   assert.deepEqual(storedParsed.formData, EMPTY_FORM_DATA);
+  assert.equal(storedParsed.currentStep, 1);
+  assert.equal(storedParsed.overviewResponse, null);
+});
+
+test('loadSessionState resets to initial form (currentStep: 1) even if prior session was at overview', () => {
+  mockStorage.set('cma_session_v2', JSON.stringify({
+    currentStep: 2,
+    overviewResponse: { status: 'success', business_overview: { business_name: 'Test Corp' } },
+    formData: { ...EMPTY_FORM_DATA },
+  }));
+
+  const refreshedSession = loadSessionState();
+
+  // Must reset to initial business form (Step 1) with null overviewResponse
+  assert.equal(refreshedSession.currentStep, 1);
+  assert.equal(refreshedSession.overviewResponse, null);
+  assert.deepEqual(refreshedSession.formData, EMPTY_FORM_DATA);
 });
 
 test('clearSessionState clears storage and returns empty form data', () => {

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from ..state import AgentState
@@ -83,6 +84,36 @@ def _homepage_html_to_scraped_page(
 
 
 async def url_discovery_node(state: AgentState) -> dict[str, Any]:
+    """Execute the URL Discovery stage with [PIPELINE_TIMING] measurement."""
+    logger.info("Entering URL Discovery Node.")
+
+    t0 = time.perf_counter()
+    status_str = "failed"
+    target_site = ""
+    try:
+        business_form = state.get("business_form") if isinstance(state, dict) else None
+        if isinstance(business_form, BusinessForm):
+            target_site = business_form.business_website
+        elif isinstance(business_form, dict):
+            target_site = business_form.get("business_website", "")
+
+        result = await _url_discovery_node_impl(state)
+        status_str = "success" if result.get("workflow_status") == "running" else "failed"
+        return result
+    except Exception:
+        status_str = "exception"
+        raise
+    finally:
+        duration = round(time.perf_counter() - t0, 2)
+        logger.info(
+            "[PIPELINE_TIMING] stage=url_discovery duration_seconds=%.2f status=%s website='%s'",
+            duration,
+            status_str,
+            target_site,
+        )
+
+
+async def _url_discovery_node_impl(state: AgentState) -> dict[str, Any]:
     """Execute the URL Discovery stage of the Competitor Marketing Agent workflow.
 
     Reads the business website URL from `state["business_form"].business_website`,
@@ -103,7 +134,7 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
         - `error_message`: Human-readable error description (on failure only).
         - `errors`: Cumulative list of error messages (on failure only).
     """
-    logger.info("Entering URL Discovery Node.")
+
 
     # 1. Validate state input structure
     if not isinstance(state, dict):
@@ -161,8 +192,8 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
             res = on_progress("visiting_website", f"Connecting to {clean_url}...", {"website_url": clean_url})
             if asyncio.iscoroutine(res):
                 await res
-        except Exception:
-            pass
+        except Exception as prog_exc:
+            logger.warning("Progress callback exception: %s", prog_exc, exc_info=True)
 
     # 3. Call existing URL discovery orchestrator
     try:

@@ -886,7 +886,7 @@ def _run_actor_sync(
     client = ApifyClient(token=token)
     run_id: str | None = None
     actor_status: str | None = None
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
     deadline = start_time + timeout_seconds
 
     try:
@@ -924,7 +924,7 @@ def _run_actor_sync(
                 run_id,
                 actor_status,
             )
-            remaining = deadline - time.monotonic()
+            remaining = deadline - time.perf_counter()
             if remaining > 0:
                 try:
                     wait_delta = datetime.timedelta(seconds=max(1.0, remaining))
@@ -1122,7 +1122,7 @@ async def crawl_selected_pages(
         A populated :class:`WebsiteCrawlResult` containing scraped pages and
         failure details.
     """
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
 
     # Determine fallback website_url from input if not explicitly provided
     resolved_website_url = website_url or ""
@@ -1142,7 +1142,7 @@ async def crawl_selected_pages(
     # 2. Check for empty candidate list
     if total_requested == 0:
         logger.warning("No valid website URLs provided to content crawler.")
-        exec_time = round(time.monotonic() - start_time, 2)
+        exec_time = round(time.perf_counter() - start_time, 2)
         diag_list = [
             _PageDiagnostic(
                 requested_url=f.url,
@@ -1188,7 +1188,7 @@ async def crawl_selected_pages(
             FailedPageScrape(url=orig_u, error_message="APIFY_API_TOKEN is not configured.", page_type=pt)
             for orig_u, pt, _ in valid_targets.values()
         ] + immediate_failures
-        exec_time = round(time.monotonic() - start_time, 2)
+        exec_time = round(time.perf_counter() - start_time, 2)
         diag_list = [
             _PageDiagnostic(
                 requested_url=f.url,
@@ -1234,7 +1234,7 @@ async def crawl_selected_pages(
             FailedPageScrape(url=orig_u, error_message="APIFY_API_TOKEN is a placeholder value.", page_type=pt)
             for orig_u, pt, _ in valid_targets.values()
         ] + immediate_failures
-        exec_time = round(time.monotonic() - start_time, 2)
+        exec_time = round(time.perf_counter() - start_time, 2)
         diag_list = [
             _PageDiagnostic(
                 requested_url=f.url,
@@ -1382,7 +1382,7 @@ async def crawl_selected_pages(
             FailedPageScrape(url=orig_u, error_message=page_err, page_type=pt)
             for orig_u, pt, _ in valid_targets.values()
         ] + immediate_failures
-        exec_time = round(time.monotonic() - start_time, 2)
+        exec_time = round(time.perf_counter() - start_time, 2)
         diag_list = [
             _PageDiagnostic(
                 requested_url=f.url,
@@ -1676,7 +1676,7 @@ async def crawl_selected_pages(
         # Items were returned, but none produced usable content (all blocked or empty)
         overall_status = "empty" if any(f.error_message and "too short" in f.error_message for f in page_failures) else "failed"
 
-    exec_time = round(time.monotonic() - start_time, 2)
+    exec_time = round(time.perf_counter() - start_time, 2)
 
     # Structured diagnostic logs
     _log_crawler_diagnostics(

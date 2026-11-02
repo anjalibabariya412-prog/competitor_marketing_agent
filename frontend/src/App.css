@@ -465,11 +465,95 @@
    Loading & Error State Inside the Right Panel
    ========================================================================== */
 .loading-content-box {
-  padding: var(--space-4) 0;
+  padding: 0 0 var(--space-4) 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
+}
+
+.error-state-box {
+  padding: var(--space-4) 0;
+}
+
+/* Informational Banner on Progress Screen */
+.progress-info-banner {
+  width: 100%;
+  box-sizing: border-box;
+  background-color: var(--color-pale-blue);
+  border: 1px solid var(--color-pale-blue-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  text-align: left;
+  margin-bottom: var(--space-6);
+}
+
+.progress-banner-illustration {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.progress-banner-svg {
+  width: 96px;
+  height: 76px;
+  display: block;
+}
+
+.progress-banner-divider {
+  width: 1px;
+  align-self: stretch;
+  background-color: var(--color-pale-blue-border);
+  flex-shrink: 0;
+  margin: 2px 0;
+}
+
+.progress-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.progress-banner-title {
+  font-family: var(--font-heading);
+  font-size: var(--text-base);
+  font-weight: 700;
+  color: var(--color-midnight);
+  line-height: 1.35;
+  margin: 0 0 6px 0;
+  letter-spacing: -0.01em;
+}
+
+.progress-banner-desc {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: #475467;
+  line-height: 1.55;
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .progress-info-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: var(--space-4);
+    gap: var(--space-4);
+  }
+
+  .progress-banner-divider {
+    width: 100%;
+    height: 1px;
+    align-self: auto;
+    margin: 0;
+  }
+
+  .progress-banner-svg {
+    width: 76px;
+    height: 60px;
+  }
 }
 
 .loading-visual-container {

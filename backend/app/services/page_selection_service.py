@@ -893,9 +893,10 @@ async def select_pages_with_llm(
     try:
         client = AsyncOpenAI(api_key=raw_api_key, timeout=30.0)
         logger.info(
-            "Requesting page selection from OpenAI model '%s' for %s (%d candidates).",
+            "Requesting page selection from OpenAI model '%s' for %s (%d sent to LLM out of %d total candidates).",
             selected_model,
             website_url,
+            len(sorted_for_prompt),
             len(candidates),
         )
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 import urllib.parse
 
@@ -64,6 +65,36 @@ def _merge_homepage_into_scraped_pages(
 
 
 async def website_crawling_node(state: AgentState) -> dict[str, Any]:
+    """Execute the Website Crawling stage with [PIPELINE_TIMING] measurement."""
+    logger.info("Entering Website Crawling Node.")
+
+    t0 = time.perf_counter()
+    status_str = "failed"
+    target_site = ""
+    try:
+        business_form = state.get("business_form") if isinstance(state, dict) else None
+        if isinstance(business_form, BusinessForm):
+            target_site = business_form.business_website
+        elif isinstance(business_form, dict):
+            target_site = business_form.get("business_website", "")
+
+        result = await _website_crawling_node_impl(state)
+        status_str = "success" if result.get("workflow_status") == "running" else "failed"
+        return result
+    except Exception:
+        status_str = "exception"
+        raise
+    finally:
+        duration = round(time.perf_counter() - t0, 2)
+        logger.info(
+            "[PIPELINE_TIMING] stage=website_crawling duration_seconds=%.2f status=%s website='%s'",
+            duration,
+            status_str,
+            target_site,
+        )
+
+
+async def _website_crawling_node_impl(state: AgentState) -> dict[str, Any]:
     """Execute the Website Crawling stage of the Competitor Marketing Agent workflow.
 
     Reads `selected_pages` from `state`, resolves the canonical `website_url`,
@@ -84,7 +115,7 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
         - `error_message`: Set on failure.
         - `errors`: Cumulative list of errors/advisories if any occurred.
     """
-    logger.info("Entering Website Crawling Node.")
+
 
     # 1. Validate state input structure
     if not isinstance(state, dict):
@@ -207,8 +238,8 @@ async def website_crawling_node(state: AgentState) -> dict[str, Any]:
             res = on_progress("reading_pages", msg, {"page_count": sel_count, "found_pages": cand_count})
             if asyncio.iscoroutine(res):
                 await res
-        except Exception:
-            pass
+        except Exception as prog_exc:
+            logger.warning("Progress callback exception: %s", prog_exc, exc_info=True)
 
     # 4. Check if existing homepage content is complete and reusable to avoid redundant crawling
     is_homepage_reusable = (

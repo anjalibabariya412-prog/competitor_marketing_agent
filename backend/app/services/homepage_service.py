@@ -533,27 +533,39 @@ async def fetch_homepage(
     render_wait_ms: int | None = None,
     max_scroll_pixels: int | None = None,
 ) -> HomepageFetchResult:
-    """Fetch the rendered homepage for the given business website URL.
+    """Fetch the rendered homepage for the given business website URL with stage timing."""
+    t0 = time.perf_counter()
+    status_str = "failed"
+    try:
+        result = await _fetch_homepage_impl(
+            website_url,
+            timeout_seconds=timeout_seconds,
+            render_wait_ms=render_wait_ms,
+            max_scroll_pixels=max_scroll_pixels,
+        )
+        status_str = result.status
+        return result
+    except Exception:
+        status_str = "exception"
+        raise
+    finally:
+        duration = round(time.perf_counter() - t0, 2)
+        logger.info(
+            "[PIPELINE_TIMING] stage=homepage_fetch duration_seconds=%.2f status=%s website='%s'",
+            duration,
+            status_str,
+            website_url,
+        )
 
-    This is the sole public entry point for this service.  Callers pass a raw
-    URL string; this function normalises it, invokes the Apify Actor, parses
-    the result, and returns a :class:`HomepageFetchResult`.
 
-    The Apify API token is read from ``settings.APIFY_API_TOKEN`` and is never
-    logged or included in error messages.
-
-    A small bounded retry policy (up to :data:`MAX_TRANSIENT_RETRIES` total
-    attempts) covers transient Actor failures. Permanent errors such as auth
-    failures or URL validation errors are not retried.
-
-    Args:
-        website_url: The raw business website URL to fetch.
-        timeout_seconds: Maximum seconds to allow the Actor run to complete.
-
-    Returns:
-        A populated :class:`HomepageFetchResult` instance.
-    """
-    start_time = time.monotonic()
+async def _fetch_homepage_impl(
+    website_url: str,
+    *,
+    timeout_seconds: int = DEFAULT_ACTOR_TIMEOUT_SECONDS,
+    render_wait_ms: int | None = None,
+    max_scroll_pixels: int | None = None,
+) -> HomepageFetchResult:
+    start_time = time.perf_counter()
 
     # --- 1. Validate and normalise the URL ---
     try:
@@ -563,7 +575,7 @@ async def fetch_homepage(
             requested_url=website_url,
             status="failed",
             error_message=f"Invalid URL: {exc}",
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
         )
 
     # --- 2. Validate Apify token ---
@@ -572,7 +584,7 @@ async def fetch_homepage(
             requested_url=normalized_url,
             status="failed",
             error_message="APIFY_API_TOKEN is not configured in settings.",
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
         )
 
     raw_token: str = settings.APIFY_API_TOKEN.get_secret_value().strip()
@@ -581,7 +593,7 @@ async def fetch_homepage(
             requested_url=normalized_url,
             status="failed",
             error_message="APIFY_API_TOKEN is set to a placeholder value.",
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
         )
 
     actor_input = _build_actor_input(
@@ -594,8 +606,10 @@ async def fetch_homepage(
     items: list[dict] = []
     run_id: str | None = None
     error_message: str | None = None
+    attempts_made = 0
 
     for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+        attempts_made = attempt
         logger.info(
             "Homepage fetch attempt %d/%d for URL: %s",
             attempt,
@@ -643,14 +657,14 @@ async def fetch_homepage(
             )
             await asyncio.sleep(backoff)
 
-    elapsed = round(time.monotonic() - start_time, 2)
+    elapsed = round(time.perf_counter() - start_time, 2)
 
     # --- 4. Handle complete Actor failure or empty dataset ---
     if error_message:
         logger.error(
             "Homepage fetch failed for %s after %d attempt(s). Run ID: %s. Error: %s",
             normalized_url,
-            MAX_TRANSIENT_RETRIES,
+            attempts_made,
             run_id,
             error_message,
         )
@@ -664,6 +678,10 @@ async def fetch_homepage(
 
     if not items:
         # Actor succeeded but returned an empty dataset
+        logger.warning(
+            "Actor run SUCCEEDED but page fetch FAILED: returned no dataset items for %s",
+            normalized_url,
+        )
         logger.warning(
             "Actor run '%s' succeeded but returned no dataset items for %s.",
             run_id,
@@ -681,6 +699,10 @@ async def fetch_homepage(
     valid_item, dataset_error = _extract_dataset_payload(items)
 
     if dataset_error:
+        logger.warning(
+            "Actor run SUCCEEDED but page fetch FAILED: %s",
+            dataset_error,
+        )
         logger.warning(
             "Actor dataset contains error items for %s. Run ID: %s. Error: %s",
             normalized_url,
@@ -700,6 +722,10 @@ async def fetch_homepage(
     http_status_code: int | None = valid_item.get("httpStatusCode") if valid_item else None
 
     if not html:
+        logger.warning(
+            "Actor run SUCCEEDED but page fetch FAILED: HTML content is empty for %s",
+            normalized_url,
+        )
         logger.warning(
             "Actor run '%s' returned an item but HTML is empty for %s.",
             run_id,

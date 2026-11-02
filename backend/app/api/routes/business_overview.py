@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -74,11 +75,25 @@ async def generate_business_overview_endpoint(
     }
 
     # 2. Asynchronously invoke the existing compiled LangGraph workflow
+    t0_pipeline = time.perf_counter()
+    pipeline_outcome = "failed"
     try:
         final_state: dict[str, Any] = await graph.ainvoke(initial_state)
+        if isinstance(final_state, dict):
+            status_val = final_state.get("workflow_status")
+            if status_val == "completed":
+                pipeline_outcome = "completed"
+            elif status_val == "failed":
+                pipeline_outcome = "failed"
+            else:
+                pipeline_outcome = status_val or "completed"
+        else:
+            pipeline_outcome = "completed"
     except HTTPException:
+        pipeline_outcome = "http_exception"
         raise
     except Exception as exc:
+        pipeline_outcome = "exception"
         logger.exception(
             "Unexpected exception while invoking LangGraph workflow for '%s': %s",
             target_url,
@@ -87,6 +102,14 @@ async def generate_business_overview_endpoint(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while processing the business overview request.",
+        )
+    finally:
+        pipeline_duration = round(time.perf_counter() - t0_pipeline, 2)
+        logger.info(
+            "[PIPELINE_TIMING] stage=total_pipeline duration_seconds=%.2f outcome=%s website='%s'",
+            pipeline_duration,
+            pipeline_outcome,
+            target_url,
         )
 
     # 3. Extract relevant state fields
@@ -223,8 +246,41 @@ async def generate_business_overview_stream_endpoint(
         "on_progress": on_progress,
     }
 
+    t0_pipeline = time.perf_counter()
+    pipeline_outcome = "failed"
+
+    async def _timed_ainvoke() -> dict[str, Any]:
+        nonlocal pipeline_outcome
+        try:
+            result = await graph.ainvoke(initial_state)
+            if isinstance(result, dict):
+                status_val = result.get("workflow_status")
+                if status_val == "completed":
+                    pipeline_outcome = "completed"
+                elif status_val == "failed":
+                    pipeline_outcome = "failed"
+                else:
+                    pipeline_outcome = status_val or "completed"
+            else:
+                pipeline_outcome = "completed"
+            return result
+        except asyncio.CancelledError:
+            pipeline_outcome = "cancelled"
+            raise
+        except Exception:
+            pipeline_outcome = "exception"
+            raise
+        finally:
+            pipeline_duration = round(time.perf_counter() - t0_pipeline, 2)
+            logger.info(
+                "[PIPELINE_TIMING] stage=total_pipeline duration_seconds=%.2f outcome=%s website='%s'",
+                pipeline_duration,
+                pipeline_outcome,
+                target_url,
+            )
+
     # Run the workflow in a background asyncio task
-    workflow_task = asyncio.create_task(graph.ainvoke(initial_state))
+    workflow_task = asyncio.create_task(_timed_ainvoke())
 
     async def event_generator():
         try:

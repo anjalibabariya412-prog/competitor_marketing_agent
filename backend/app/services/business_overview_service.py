@@ -20,6 +20,7 @@ Key Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import urllib.parse
@@ -666,7 +667,7 @@ async def generate_business_overview(
     Returns:
         A populated :class:`BusinessOverviewResult` containing the overview and metadata.
     """
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
 
     async def _emit_progress(stage: str, message: str, meta: dict[str, Any] | None = None) -> None:
         if on_progress:
@@ -675,7 +676,7 @@ async def generate_business_overview(
                 if asyncio.iscoroutine(res):
                     await res
             except Exception as prog_exc:
-                logger.debug("Progress callback exception (ignored): %s", prog_exc)
+                logger.warning("Progress callback exception: %s", prog_exc, exc_info=True)
 
     # 1. Extract and validate usable scraped pages
     usable_pages, inferred_url = _extract_usable_pages(crawl_input)
@@ -715,7 +716,7 @@ async def generate_business_overview(
             total_pages_analyzed=len(usable_pages),
             total_findings=0,
             model_used=None,
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
             error_message=msg,
         )
 
@@ -739,7 +740,7 @@ async def generate_business_overview(
             total_pages_analyzed=len(usable_pages),
             total_findings=0,
             model_used=resolved_model,
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
             error_message=err,
         )
 
@@ -754,7 +755,7 @@ async def generate_business_overview(
             total_pages_analyzed=len(usable_pages),
             total_findings=0,
             model_used=resolved_model,
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
             error_message=err,
         )
 
@@ -838,7 +839,7 @@ async def generate_business_overview(
                 total_pages_analyzed=len(included_pages),
                 total_findings=0,
                 model_used=resolved_model,
-                execution_time_seconds=round(time.monotonic() - start_time, 2),
+                execution_time_seconds=round(time.perf_counter() - start_time, 2),
                 error_message=err,
             )
 
@@ -857,7 +858,7 @@ async def generate_business_overview(
             business_form=business_form,
         )
 
-        exec_time = round(time.monotonic() - start_time, 2)
+        exec_time = round(time.perf_counter() - start_time, 2)
         logger.info(
             "Successfully generated business overview for %s in %.2fs (%d products).",
             resolved_website_url,
@@ -886,7 +887,7 @@ async def generate_business_overview(
             total_pages_analyzed=len(usable_pages),
             total_findings=0,
             model_used=resolved_model,
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
             error_message=err_msg,
         )
     except Exception as exc:
@@ -899,6 +900,6 @@ async def generate_business_overview(
             total_pages_analyzed=len(usable_pages),
             total_findings=0,
             model_used=resolved_model,
-            execution_time_seconds=round(time.monotonic() - start_time, 2),
+            execution_time_seconds=round(time.perf_counter() - start_time, 2),
             error_message=err_msg,
         )

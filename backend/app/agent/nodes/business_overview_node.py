@@ -11,6 +11,7 @@ resulting `overview_result` and `business_overview` in `AgentState`.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 import urllib.parse
 
@@ -28,6 +29,36 @@ logger = logging.getLogger(__name__)
 
 
 async def business_overview_node(state: AgentState) -> dict[str, Any]:
+    """Execute the Business Overview stage with [PIPELINE_TIMING] measurement."""
+    logger.info("Entering Business Overview Node.")
+
+    t0 = time.perf_counter()
+    status_str = "failed"
+    target_site = ""
+    try:
+        business_form = state.get("business_form") if isinstance(state, dict) else None
+        if isinstance(business_form, BusinessForm):
+            target_site = business_form.business_website
+        elif isinstance(business_form, dict):
+            target_site = business_form.get("business_website", "")
+
+        result = await _business_overview_node_impl(state)
+        status_str = "success" if result.get("workflow_status") == "completed" else "failed"
+        return result
+    except Exception:
+        status_str = "exception"
+        raise
+    finally:
+        duration = round(time.perf_counter() - t0, 2)
+        logger.info(
+            "[PIPELINE_TIMING] stage=business_overview duration_seconds=%.2f status=%s website='%s'",
+            duration,
+            status_str,
+            target_site,
+        )
+
+
+async def _business_overview_node_impl(state: AgentState) -> dict[str, Any]:
     """Execute the Business Overview stage of the Competitor Marketing Agent workflow.
 
     Reads `business_form`, `crawl_result`, and `scraped_pages` from `state`,
@@ -48,7 +79,7 @@ async def business_overview_node(state: AgentState) -> dict[str, Any]:
         - `error_message`: Set on failure.
         - `errors`: Cumulative list of error messages if any occurred.
     """
-    logger.info("Entering Business Overview Node.")
+
 
     # 1. Validate state input structure
     if not isinstance(state, dict):

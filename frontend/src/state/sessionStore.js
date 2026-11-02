@@ -1,7 +1,7 @@
 /**
  * Session State Store for Competitor Marketing Agent.
  * Manages workflow state, theme, and downstream competitor analysis in sessionStorage.
- * Form field inputs are never persisted across browser reloads or page refreshes.
+ * Form field inputs and generated business overview are never persisted across browser reloads or page refreshes.
  */
 
 const STORAGE_KEY = 'cma_session_v2';
@@ -28,7 +28,8 @@ export const INITIAL_STATE = {
 
 /**
  * Loads session state from sessionStorage with fallback to initial state.
- * Form input fields are strictly initialized empty on every fresh load / browser refresh.
+ * Form input fields and generated overview are strictly reset on every fresh load / browser refresh,
+ * ensuring the initial form (Step 1) is always displayed.
  * @returns {typeof INITIAL_STATE}
  */
 export function loadSessionState() {
@@ -39,7 +40,9 @@ export function loadSessionState() {
     return {
       ...INITIAL_STATE,
       ...parsed,
-      // Form fields are never restored from storage on refresh
+      // Always reset to initial business form on browser refresh / page reload
+      currentStep: 1,
+      overviewResponse: null,
       formData: { ...EMPTY_FORM_DATA },
       competitors: Array.isArray(parsed.competitors) && parsed.competitors.length > 0
         ? parsed.competitors
@@ -51,15 +54,23 @@ export function loadSessionState() {
 }
 
 /**
- * Persists session state to sessionStorage, omitting form inputs so they are not restored on refresh.
+ * Persists session state to sessionStorage, omitting form inputs and overview state
+ * so browser refresh always returns to the initial form.
  * @param {Object} state 
  */
 export function saveSessionState(state) {
   try {
     if (typeof sessionStorage === 'undefined') return;
-    const { formData: _ignored, ...persistedState } = state;
+    const {
+      formData: _ignoredForm,
+      overviewResponse: _ignoredOverview,
+      currentStep: _ignoredStep,
+      ...persistedState
+    } = state;
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
       ...persistedState,
+      currentStep: 1,
+      overviewResponse: null,
       formData: { ...EMPTY_FORM_DATA },
     }));
   } catch (err) {

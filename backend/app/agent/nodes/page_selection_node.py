@@ -10,6 +10,7 @@ and populates `selection_result` and `selected_pages` in `AgentState`.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 import urllib.parse
 
@@ -46,6 +47,36 @@ def _normalize_url_for_merge(url: str) -> str:
 
 
 async def page_selection_node(state: AgentState) -> dict[str, Any]:
+    """Execute the Page Selection stage with [PIPELINE_TIMING] measurement."""
+    logger.info("Entering Page Selection Node.")
+
+    t0 = time.perf_counter()
+    status_str = "failed"
+    target_site = ""
+    try:
+        business_form = state.get("business_form") if isinstance(state, dict) else None
+        if isinstance(business_form, BusinessForm):
+            target_site = business_form.business_website
+        elif isinstance(business_form, dict):
+            target_site = business_form.get("business_website", "")
+
+        result = await _page_selection_node_impl(state)
+        status_str = "success" if result.get("workflow_status") == "running" else "failed"
+        return result
+    except Exception:
+        status_str = "exception"
+        raise
+    finally:
+        duration = round(time.perf_counter() - t0, 2)
+        logger.info(
+            "[PIPELINE_TIMING] stage=page_selection duration_seconds=%.2f status=%s website='%s'",
+            duration,
+            status_str,
+            target_site,
+        )
+
+
+async def _page_selection_node_impl(state: AgentState) -> dict[str, Any]:
     """Execute the Page Selection stage of the Competitor Marketing Agent workflow.
 
     Reads `candidate_urls` from `state`, extracts the target `website_url` from
@@ -64,7 +95,7 @@ async def page_selection_node(state: AgentState) -> dict[str, Any]:
         - `error_message`: Set on failure.
         - `errors`: Cumulative list of errors/advisories if any occurred.
     """
-    logger.info("Entering Page Selection Node.")
+
 
     # 1. Validate state input structure
     if not isinstance(state, dict):
