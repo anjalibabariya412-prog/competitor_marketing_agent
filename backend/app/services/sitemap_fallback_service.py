@@ -442,6 +442,8 @@ async def discover_sitemap_urls(
         total_files_fetched = 0
         discovered_candidates: list[CandidateURL] = []
         seen_candidate_urls: set[str] = set()
+        sitemaps_blocked = 0
+        sitemaps_not_found = 0
 
         while (
             (sitemaps_to_explore or (not discovered_candidates and not probed_common))
@@ -470,7 +472,16 @@ async def discover_sitemap_urls(
 
             try:
                 resp = await client.get(target_sitemap_url)
-                if resp.status_code != 200 or not resp.content:
+                if resp.status_code in (401, 403):
+                    sitemaps_blocked += 1
+                    logger.warning("Sitemap probe '%s' blocked by server (HTTP %d).", target_sitemap_url, resp.status_code)
+                    continue
+                elif resp.status_code == 404:
+                    sitemaps_not_found += 1
+                    logger.debug("Sitemap '%s' returned HTTP 404.", target_sitemap_url)
+                    continue
+                elif resp.status_code != 200 or not resp.content:
+                    logger.debug("Sitemap '%s' returned HTTP %d with empty or non-200 content.", target_sitemap_url, resp.status_code)
                     continue
 
                 total_files_fetched += 1
@@ -576,6 +587,21 @@ async def discover_sitemap_urls(
             base_url=base_url,
             status="empty_sitemap",
             message="Sitemap files were found and parsed, but contained no valid internal URLs.",
+            sitemaps_checked=sitemaps_checked,
+            candidate_urls=[],
+            total_found=0,
+        )
+
+    if sitemaps_blocked > 0:
+        logger.warning(
+            "Sitemap fallback for %s: %d probe(s) were blocked (HTTP 403/401); no sitemap candidates recovered.",
+            base_url,
+            sitemaps_blocked,
+        )
+        return SitemapDiscoveryResult(
+            base_url=base_url,
+            status="failed",
+            message=f"Sitemap probes were blocked by the target server (HTTP 403/401 on {sitemaps_blocked} probe(s)).",
             sitemaps_checked=sitemaps_checked,
             candidate_urls=[],
             total_found=0,

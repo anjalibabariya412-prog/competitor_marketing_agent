@@ -819,6 +819,7 @@ async def generate_business_overview(
     try:
         client = AsyncOpenAI(api_key=raw_api_key, timeout=timeout_seconds)
 
+        t_llm = time.perf_counter()
         completion = await client.beta.chat.completions.parse(
             model=resolved_model,
             messages=[
@@ -826,6 +827,24 @@ async def generate_business_overview(
                 {"role": "user", "content": user_prompt},
             ],
             response_format=BusinessOverview,
+        )
+        llm_duration = round(time.perf_counter() - t_llm, 2)
+        usage = getattr(completion, "usage", None)
+        prompt_tokens = usage.prompt_tokens if usage else None
+        completion_tokens = usage.completion_tokens if usage else None
+        total_tokens = usage.total_tokens if usage else None
+
+        logger.info(
+            "[BUSINESS_OVERVIEW_LLM] website='%s' model='%s' duration_seconds=%.2f "
+            "pages=%d prompt_chars=%d prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            resolved_website_url,
+            resolved_model,
+            llm_duration,
+            len(included_pages),
+            len(user_prompt),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
         )
 
         parsed_overview: BusinessOverview | None = completion.choices[0].message.parsed

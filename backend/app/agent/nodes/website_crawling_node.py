@@ -18,7 +18,9 @@ import urllib.parse
 from ..state import AgentState
 from backend.app.core.config import settings
 from backend.app.schemas.business_form import BusinessForm
+from backend.app.schemas.enums import PageType
 from backend.app.schemas.scraped_data import ScrapedPage
+from backend.app.services.content_validation import is_content_adequate
 from backend.app.services.page_selection_service import SelectedPage
 from backend.app.services.sitemap_fallback_service import WebsiteURLDiscoveryResult
 from backend.app.services.website_content_crawler_service import (
@@ -49,11 +51,26 @@ def _merge_homepage_into_scraped_pages(
     homepage_scraped_page: ScrapedPage | None,
     scraped_pages: list[ScrapedPage],
 ) -> list[ScrapedPage]:
-    """Prepend homepage_scraped_page to scraped_pages if usable and not already present."""
+    """Prepend homepage_scraped_page to scraped_pages if usable, adequate, and not already present."""
     if homepage_scraped_page is None:
         return list(scraped_pages)
 
     if not homepage_scraped_page.content or not homepage_scraped_page.content.strip():
+        return list(scraped_pages)
+
+    # If homepage content is inadequate (e.g. SPA skeleton, cookie banner) and we have other crawled pages, skip merging it
+    is_adeq, _ = is_content_adequate(
+        homepage_scraped_page.content,
+        url=homepage_scraped_page.url,
+        page_type=PageType.HOME,
+        min_chars=settings.MIN_HOMEPAGE_ADEQUACY_CHARS,
+    )
+    if not is_adeq and scraped_pages:
+        logger.info(
+            "Skipping merging of inadequate homepage content (%d chars) because crawler retrieved %d pages.",
+            len(homepage_scraped_page.content.strip()),
+            len(scraped_pages),
+        )
         return list(scraped_pages)
 
     crawled_urls_normalized = {_normalize_url_for_merge(p.url) for p in scraped_pages}
@@ -241,12 +258,23 @@ async def _website_crawling_node_impl(state: AgentState) -> dict[str, Any]:
         except Exception as prog_exc:
             logger.warning("Progress callback exception: %s", prog_exc, exc_info=True)
 
-    # 4. Check if existing homepage content is complete and reusable to avoid redundant crawling
-    is_homepage_reusable = (
-        homepage_scraped_page is not None
-        and bool(homepage_scraped_page.content and homepage_scraped_page.content.strip())
-        and len(homepage_scraped_page.content.strip()) >= MIN_PAGE_CONTENT_CHARS
-    )
+    # 4. Check if existing homepage content is complete, adequate, and reusable to avoid redundant crawling
+    is_homepage_reusable = False
+    if homepage_scraped_page is not None and bool(homepage_scraped_page.content and homepage_scraped_page.content.strip()):
+        is_adeq, adeq_reason = is_content_adequate(
+            homepage_scraped_page.content,
+            url=homepage_scraped_page.url or clean_url,
+            page_type=PageType.HOME,
+            min_chars=settings.MIN_HOMEPAGE_ADEQUACY_CHARS,
+        )
+        is_homepage_reusable = is_adeq
+        if not is_adeq:
+            logger.warning(
+                "Homepage content in state is inadequate (%s, %d chars). "
+                "Allowing homepage to be recrawled if selected.",
+                adeq_reason,
+                len(homepage_scraped_page.content.strip()),
+            )
 
     pages_to_crawl: list[SelectedPage] = []
     homepage_reused = False

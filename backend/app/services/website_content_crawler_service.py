@@ -31,6 +31,7 @@ import time
 import urllib.parse
 from typing import Any, Literal, Sequence
 
+import httpx
 from apify_client import ApifyClient
 from apify_client.errors import ApifyApiError
 from bs4 import BeautifulSoup
@@ -39,6 +40,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.app.core.config import settings
 from backend.app.schemas.enums import PageType
 from backend.app.schemas.scraped_data import ScrapedPage
+from backend.app.services.content_validation import (
+    is_blocked_content,
+    is_content_adequate,
+    log_http_response_diagnostics,
+)
 from .page_selection_service import (
     PageSelectionResult,
     SelectedPage,
@@ -275,6 +281,7 @@ class _PageDiagnostic:
     is_truncated: bool = False
     error_category: str | None = None
     error_reason: str | None = None
+    retrieval_method: str = "browser"  # "http" or "browser"
 
 
 def _extract_item_duration(item: dict[str, Any]) -> float | None:
@@ -417,11 +424,12 @@ def _log_crawler_diagnostics(
         if d.status == "SUCCESS":
             trunc_part = " [truncated]" if d.is_truncated else ""
             logger.info(
-                "  [%d/%d] SUCCESS | url='%s'%s | status=%s | duration=%s | content=%d chars%s",
+                "  [%d/%d] SUCCESS | url='%s'%s | method=%s | status=%s | duration=%s | content=%d chars%s",
                 idx,
                 len(diagnostics),
                 d.requested_url,
                 redirect_part,
+                d.retrieval_method,
                 http_part,
                 timing_part,
                 d.char_count,
@@ -429,11 +437,12 @@ def _log_crawler_diagnostics(
             )
         else:
             logger.warning(
-                "  [%d/%d] FAILED  | url='%s'%s | status=%s | duration=%s | content=%d chars | error=[%s] %s",
+                "  [%d/%d] FAILED  | url='%s'%s | method=%s | status=%s | duration=%s | content=%d chars | error=[%s] %s",
                 idx,
                 len(diagnostics),
                 d.requested_url,
                 redirect_part,
+                d.retrieval_method,
                 http_part,
                 timing_part,
                 d.char_count,
@@ -444,6 +453,8 @@ def _log_crawler_diagnostics(
     # Compute aggregate metrics
     total_content_chars = sum(d.char_count for d in diagnostics if d.status == "SUCCESS")
     measured_durations = [d.duration_seconds for d in diagnostics if d.duration_seconds is not None]
+    http_success_count = sum(1 for d in diagnostics if d.status == "SUCCESS" and d.retrieval_method == "http")
+    browser_success_count = sum(1 for d in diagnostics if d.status == "SUCCESS" and d.retrieval_method == "browser")
 
     if measured_durations:
         min_d = min(measured_durations)
@@ -470,7 +481,7 @@ def _log_crawler_diagnostics(
         "=== [CRAWLER AGGREGATE SUMMARY: %s] ===\n"
         "  • Crawl Outcome: %s (Actor Status: %s)%s\n"
         "  • Total Requested URLs: %d\n"
-        "  • Successful Pages: %d\n"
+        "  • Successful Pages: %d (HTTP: %d, Browser: %d)\n"
         "  • Failed Pages: %d\n"
         "  • Total Extracted Content: %s characters across %d successful page(s)\n"
         "  • Crawler Wall-Clock Duration: %.2fs\n"
@@ -481,6 +492,8 @@ def _log_crawler_diagnostics(
         flags_part,
         total_requested,
         total_scraped,
+        http_success_count,
+        browser_success_count,
         total_failed,
         f"{total_content_chars:,}",
         total_scraped,
@@ -1094,6 +1107,157 @@ def _normalize_input_pages(
     return valid_targets, failures
 
 
+async def _fetch_single_page_http(
+    client: httpx.AsyncClient,
+    orig_url: str,
+    p_type: PageType,
+    prior_title: str | None,
+) -> tuple[bool, ScrapedPage | None, _PageDiagnostic, str]:
+    """Fetch a single page directly via HTTP and validate adequacy.
+
+    Returns:
+        (is_success, scraped_page, diagnostic, fallback_reason)
+    """
+    t_start = time.perf_counter()
+    try:
+        resp = await client.get(orig_url)
+        elapsed = round(time.perf_counter() - t_start, 2)
+        status_code = resp.status_code
+        final_url = str(resp.url)
+        html_content = resp.text or ""
+
+        if status_code != 200:
+            log_http_response_diagnostics(
+                resp,
+                stage="internal_page",
+                duration_seconds=elapsed,
+                logger_instance=logger,
+            )
+            cat, reason = _categorize_error(f"HTTP {status_code}", status_code)
+            diag = _PageDiagnostic(
+                requested_url=orig_url,
+                final_url=final_url,
+                status="FAILED",
+                http_status=status_code,
+                duration_seconds=elapsed,
+                char_count=0,
+                is_truncated=False,
+                error_category=cat,
+                error_reason=reason,
+                retrieval_method="http",
+            )
+            return False, None, diag, f"http_status_{status_code}"
+
+        if not html_content or _is_blocked_content(html_content) or is_blocked_content(html_content):
+            diag = _PageDiagnostic(
+                requested_url=orig_url,
+                final_url=final_url,
+                status="FAILED",
+                http_status=status_code,
+                duration_seconds=elapsed,
+                char_count=0,
+                is_truncated=False,
+                error_category="ACCESS_DENIED",
+                error_reason="Bot challenge or access denial detected via HTTP",
+                retrieval_method="http",
+            )
+            return False, None, diag, "waf_or_bot_challenge"
+
+        clean_text = _extract_text_from_html(html_content)
+        cleaned_text, is_blocked, is_truncated = _clean_page_content(clean_text)
+
+        if is_blocked:
+            diag = _PageDiagnostic(
+                requested_url=orig_url,
+                final_url=final_url,
+                status="FAILED",
+                http_status=status_code,
+                duration_seconds=elapsed,
+                char_count=len(cleaned_text),
+                is_truncated=False,
+                error_category="ACCESS_DENIED",
+                error_reason="Bot challenge detected in content",
+                retrieval_method="http",
+            )
+            return False, None, diag, "access_denied_in_content"
+
+        adequate, reason = is_content_adequate(
+            cleaned_text,
+            url=final_url,
+            page_type=p_type,
+            min_chars=settings.MIN_PAGE_ADEQUACY_CHARS,
+        )
+        if not adequate:
+            cat, cat_reason = _categorize_error(reason, status_code)
+            diag = _PageDiagnostic(
+                requested_url=orig_url,
+                final_url=final_url,
+                status="FAILED",
+                http_status=status_code,
+                duration_seconds=elapsed,
+                char_count=len(cleaned_text),
+                is_truncated=False,
+                error_category=cat,
+                error_reason=cat_reason,
+                retrieval_method="http",
+            )
+            return False, None, diag, reason
+
+        extracted_title = prior_title
+        try:
+            soup = BeautifulSoup(html_content, "html.parser")
+            title_elem = soup.find("title")
+            if title_elem and title_elem.get_text(strip=True):
+                extracted_title = title_elem.get_text(strip=True)
+        except Exception:
+            pass
+
+        scraped_page = ScrapedPage(
+            url=orig_url,
+            title=extracted_title,
+            content=cleaned_text,
+            page_type=p_type,
+            status_code=status_code,
+            metadata={
+                "requested_url": orig_url,
+                "final_url": final_url,
+                "char_count": len(cleaned_text),
+                "is_truncated": is_truncated,
+                "duration_seconds": elapsed,
+                "retrieval_method": "http",
+                "actor_id": None,
+            },
+        )
+        diag = _PageDiagnostic(
+            requested_url=orig_url,
+            final_url=final_url,
+            status="SUCCESS",
+            http_status=status_code,
+            duration_seconds=elapsed,
+            char_count=len(cleaned_text),
+            is_truncated=is_truncated,
+            retrieval_method="http",
+        )
+        return True, scraped_page, diag, ""
+
+    except Exception as exc:
+        elapsed = round(time.perf_counter() - t_start, 2)
+        cat, reason = _categorize_error(str(exc))
+        diag = _PageDiagnostic(
+            requested_url=orig_url,
+            final_url=orig_url,
+            status="FAILED",
+            http_status=None,
+            duration_seconds=elapsed,
+            char_count=0,
+            is_truncated=False,
+            error_category=cat,
+            error_reason=f"{type(exc).__name__}: {exc}",
+            retrieval_method="http",
+        )
+        return False, None, diag, f"{type(exc).__name__}: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Public Service API
 # ---------------------------------------------------------------------------
@@ -1181,15 +1345,60 @@ async def crawl_selected_pages(
             error_message="No valid non-social website URLs submitted for crawling.",
         )
 
-    # 3. Validate Apify API token from settings
-    if not settings.APIFY_API_TOKEN:
-        logger.error("APIFY_API_TOKEN is not configured in settings.")
-        failed_list = [
-            FailedPageScrape(url=orig_u, error_message="APIFY_API_TOKEN is not configured.", page_type=pt)
-            for orig_u, pt, _ in valid_targets.values()
-        ] + immediate_failures
+    # 3. HTTP-First Retrieval with fallback tracking
+    http_successes: list[ScrapedPage] = []
+    http_diagnostics: list[_PageDiagnostic] = []
+    fallback_targets: dict[str, tuple[str, PageType, str | None]] = {}
+
+    if settings.HTTP_FIRST_RETRIEVAL:
+        logger.info(
+            "Attempting HTTP-first retrieval for %d selected pages...",
+            len(valid_targets),
+        )
+        http_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        async with httpx.AsyncClient(
+            timeout=settings.HTTP_RETRIEVAL_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers=http_headers,
+            verify=True,
+        ) as client:
+            tasks = [
+                _fetch_single_page_http(client, orig_u, pt, prior_title)
+                for orig_u, pt, prior_title in valid_targets.values()
+            ]
+            results = await asyncio.gather(*tasks)
+
+        for (norm_u, target_info), (success, page, diag, fb_reason) in zip(valid_targets.items(), results):
+            if success and page is not None:
+                http_successes.append(page)
+                http_diagnostics.append(diag)
+                logger.info(
+                    "[HTTP_FIRST] Successfully retrieved '%s' via HTTP (%d chars, %.2fs).",
+                    target_info[0],
+                    len(page.content),
+                    diag.duration_seconds or 0.0,
+                )
+            else:
+                fallback_targets[norm_u] = target_info
+                logger.info(
+                    "[HTTP_FIRST] Page '%s' requires browser fallback (reason: %s).",
+                    target_info[0],
+                    fb_reason,
+                )
+    else:
+        fallback_targets = dict(valid_targets)
+
+    # If all pages succeeded via HTTP, return immediately without browser crawler
+    if not fallback_targets:
         exec_time = round(time.perf_counter() - start_time, 2)
-        diag_list = [
+        imm_diags = [
             _PageDiagnostic(
                 requested_url=f.url,
                 final_url=f.url,
@@ -1200,15 +1409,77 @@ async def crawl_selected_pages(
                 is_truncated=False,
                 error_category=_categorize_error(f.error_message, f.status_code)[0],
                 error_reason=_categorize_error(f.error_message, f.status_code)[1],
+                retrieval_method="http",
+            )
+            for f in immediate_failures
+        ]
+        all_diags = http_diagnostics + imm_diags
+        overall_status: Literal["success", "partial", "empty", "failed"] = (
+            "success" if not immediate_failures else "partial"
+        )
+        _log_crawler_diagnostics(
+            website_url=resolved_website_url,
+            overall_status=overall_status,
+            actor_status=None,
+            total_requested=total_requested,
+            total_scraped=len(http_successes),
+            total_failed=len(immediate_failures),
+            wall_clock_seconds=exec_time,
+            diagnostics=all_diags,
+        )
+        logger.info(
+            "Website content crawler finished for %s via HTTP: status=%s, scraped=%d/%d, failed=%d (time=%.2fs).",
+            resolved_website_url,
+            overall_status,
+            len(http_successes),
+            total_requested,
+            len(immediate_failures),
+            exec_time,
+        )
+        return WebsiteCrawlResult(
+            website_url=resolved_website_url,
+            status=overall_status,
+            scraped_pages=http_successes,
+            failed_pages=list(immediate_failures),
+            total_requested=total_requested,
+            total_scraped=len(http_successes),
+            total_failed=len(immediate_failures),
+            has_usable_content=bool(http_successes),
+            actor_run_id=None,
+            actor_status=None,
+            execution_time_seconds=exec_time,
+        )
+
+    # 4. Validate Apify API token from settings for fallback targets
+    if not settings.APIFY_API_TOKEN:
+        logger.error("APIFY_API_TOKEN is not configured in settings.")
+        failed_list = [
+            FailedPageScrape(url=orig_u, error_message="APIFY_API_TOKEN is not configured.", page_type=pt)
+            for orig_u, pt, _ in fallback_targets.values()
+        ] + immediate_failures
+        exec_time = round(time.perf_counter() - start_time, 2)
+        diag_list = http_diagnostics + [
+            _PageDiagnostic(
+                requested_url=f.url,
+                final_url=f.url,
+                status="FAILED",
+                http_status=f.status_code,
+                duration_seconds=None,
+                char_count=0,
+                is_truncated=False,
+                error_category=_categorize_error(f.error_message, f.status_code)[0],
+                error_reason=_categorize_error(f.error_message, f.status_code)[1],
+                retrieval_method="browser",
             )
             for f in failed_list
         ]
+        fb_status: Literal["success", "partial", "empty", "failed"] = "partial" if http_successes else "failed"
         _log_crawler_diagnostics(
             website_url=resolved_website_url,
-            overall_status="failed",
+            overall_status=fb_status,
             actor_status=None,
             total_requested=total_requested,
-            total_scraped=0,
+            total_scraped=len(http_successes),
             total_failed=len(failed_list),
             wall_clock_seconds=exec_time,
             diagnostics=diag_list,
@@ -1216,13 +1487,13 @@ async def crawl_selected_pages(
         )
         return WebsiteCrawlResult(
             website_url=resolved_website_url,
-            status="failed",
-            scraped_pages=[],
+            status=fb_status,
+            scraped_pages=http_successes,
             failed_pages=failed_list,
             total_requested=total_requested,
-            total_scraped=0,
-            total_failed=total_requested + len(immediate_failures),
-            has_usable_content=False,
+            total_scraped=len(http_successes),
+            total_failed=len(failed_list),
+            has_usable_content=bool(http_successes),
             execution_time_seconds=exec_time,
             error_message="APIFY_API_TOKEN is not configured in settings.",
         )
@@ -1232,10 +1503,10 @@ async def crawl_selected_pages(
         logger.error("APIFY_API_TOKEN is set to a placeholder value.")
         failed_list = [
             FailedPageScrape(url=orig_u, error_message="APIFY_API_TOKEN is a placeholder value.", page_type=pt)
-            for orig_u, pt, _ in valid_targets.values()
+            for orig_u, pt, _ in fallback_targets.values()
         ] + immediate_failures
         exec_time = round(time.perf_counter() - start_time, 2)
-        diag_list = [
+        diag_list = http_diagnostics + [
             _PageDiagnostic(
                 requested_url=f.url,
                 final_url=f.url,
@@ -1246,15 +1517,17 @@ async def crawl_selected_pages(
                 is_truncated=False,
                 error_category=_categorize_error(f.error_message, f.status_code)[0],
                 error_reason=_categorize_error(f.error_message, f.status_code)[1],
+                retrieval_method="browser",
             )
             for f in failed_list
         ]
+        fb_status = "partial" if http_successes else "failed"
         _log_crawler_diagnostics(
             website_url=resolved_website_url,
-            overall_status="failed",
+            overall_status=fb_status,
             actor_status=None,
             total_requested=total_requested,
-            total_scraped=0,
+            total_scraped=len(http_successes),
             total_failed=len(failed_list),
             wall_clock_seconds=exec_time,
             diagnostics=diag_list,
@@ -1262,22 +1535,22 @@ async def crawl_selected_pages(
         )
         return WebsiteCrawlResult(
             website_url=resolved_website_url,
-            status="failed",
-            scraped_pages=[],
+            status=fb_status,
+            scraped_pages=http_successes,
             failed_pages=failed_list,
             total_requested=total_requested,
-            total_scraped=0,
-            total_failed=total_requested + len(immediate_failures),
-            has_usable_content=False,
+            total_scraped=len(http_successes),
+            total_failed=len(failed_list),
+            has_usable_content=bool(http_successes),
             execution_time_seconds=exec_time,
             error_message="APIFY_API_TOKEN is set to a placeholder value.",
         )
 
-    # 4. Prepare Actor input configuration
-    urls_to_scrape = [orig_u for orig_u, _, _ in valid_targets.values()]
+    # 5. Prepare Actor input configuration for fallback targets only
+    urls_to_scrape = [orig_u for orig_u, _, _ in fallback_targets.values()]
     actor_input = _build_actor_input(urls_to_scrape, timeout_seconds=timeout_seconds)
 
-    # 5. Execute Actor with transient retries
+    # 6. Execute Actor with transient retries
     items: list[dict[str, Any]] = []
     actor_run_id: str | None = None
     last_error: str | None = None
@@ -1309,7 +1582,6 @@ async def crawl_selected_pages(
             break
 
         # If partial dataset items were recovered, DO NOT retry a full crawl!
-        # Re-crawling all pages would waste time/cost and likely timeout again.
         if items:
             logger.info(
                 "Recovered %d dataset items from run with status '%s'; avoiding full retry.",
@@ -1318,11 +1590,6 @@ async def crawl_selected_pages(
             )
             break
 
-        # Do not launch duplicate actor runs if:
-        # - Actor is nonterminal (RUNNING, READY) -> still active on platform!
-        # - Actor already succeeded (even if dataset read failed)
-        # - Actor TIMED-OUT or ABORTED
-        # - Auth or Not Found errors
         if actor_final_status in NON_TERMINAL_STATUSES:
             logger.warning(
                 "Actor run '%s' remained nonterminal ('%s'); aborting retries without starting duplicate crawl.",
@@ -1380,10 +1647,10 @@ async def crawl_selected_pages(
 
         failed_list = [
             FailedPageScrape(url=orig_u, error_message=page_err, page_type=pt)
-            for orig_u, pt, _ in valid_targets.values()
+            for orig_u, pt, _ in fallback_targets.values()
         ] + immediate_failures
         exec_time = round(time.perf_counter() - start_time, 2)
-        diag_list = [
+        diag_list = http_diagnostics + [
             _PageDiagnostic(
                 requested_url=f.url,
                 final_url=f.url,
@@ -1394,15 +1661,17 @@ async def crawl_selected_pages(
                 is_truncated=False,
                 error_category=_categorize_error(f.error_message, f.status_code)[0],
                 error_reason=_categorize_error(f.error_message, f.status_code)[1],
+                retrieval_method="browser",
             )
             for f in failed_list
         ]
+        overall_status = "partial" if http_successes else "failed"
         _log_crawler_diagnostics(
             website_url=resolved_website_url,
-            overall_status="failed",
+            overall_status=overall_status,
             actor_status=actor_final_status,
             total_requested=total_requested,
-            total_scraped=0,
+            total_scraped=len(http_successes),
             total_failed=len(failed_list),
             wall_clock_seconds=exec_time,
             diagnostics=diag_list,
@@ -1411,41 +1680,24 @@ async def crawl_selected_pages(
         )
         return WebsiteCrawlResult(
             website_url=resolved_website_url,
-            status="failed",
-            scraped_pages=[],
+            status=overall_status,
+            scraped_pages=http_successes,
             failed_pages=failed_list,
             total_requested=total_requested,
-            total_scraped=0,
+            total_scraped=len(http_successes),
             total_failed=len(failed_list),
-            has_usable_content=False,
+            has_usable_content=bool(http_successes),
             actor_run_id=actor_run_id,
             actor_status=actor_final_status,
             execution_time_seconds=exec_time,
             error_message=err_msg,
         )
 
-    # 6. Parse and validate returned dataset items
-    scraped_pages: list[ScrapedPage] = []
-    page_failures: list[FailedPageScrape] = list(immediate_failures)
+    # 7. Parse and validate returned dataset items
+    browser_scraped_pages: list[ScrapedPage] = []
+    browser_failures: list[FailedPageScrape] = []
     processed_targets: set[str] = set()
-    diagnostics: list[_PageDiagnostic] = []
-
-    # Record immediate failures (e.g. social media or malformed URLs)
-    for imm_fail in immediate_failures:
-        cat, reason = _categorize_error(imm_fail.error_message, imm_fail.status_code)
-        diagnostics.append(
-            _PageDiagnostic(
-                requested_url=imm_fail.url,
-                final_url=imm_fail.url,
-                status="FAILED",
-                http_status=imm_fail.status_code,
-                duration_seconds=None,
-                char_count=0,
-                is_truncated=False,
-                error_category=cat,
-                error_reason=reason,
-            )
-        )
+    browser_diagnostics: list[_PageDiagnostic] = []
 
     for item in items:
         # Extract returned URL
@@ -1458,22 +1710,20 @@ async def crawl_selected_pages(
         )
         norm_item_url = _normalize_target_url(item_url) if item_url else None
 
-        # Find matching requested target
+        # Find matching requested target among fallback_targets
         matched_norm: str | None = None
-        if norm_item_url and norm_item_url in valid_targets:
+        if norm_item_url and norm_item_url in fallback_targets:
             matched_norm = norm_item_url
         else:
             # Fallback path matching
-            for target_norm in valid_targets:
+            for target_norm in fallback_targets:
                 if target_norm not in processed_targets:
-                    # Compare host and path
                     p1 = urllib.parse.urlsplit(target_norm)
                     p2 = urllib.parse.urlsplit(norm_item_url or "")
                     if p1.netloc == p2.netloc and p1.path == p2.path:
                         matched_norm = target_norm
                         break
 
-        # If item doesn't map to a requested target, ignore it to prevent scope creep
         if not matched_norm:
             logger.debug("Received dataset item with unrequested URL: %s; skipping.", item_url)
             continue
@@ -1483,7 +1733,7 @@ async def crawl_selected_pages(
             continue
 
         processed_targets.add(matched_norm)
-        orig_url, p_type, prior_title = valid_targets[matched_norm]
+        orig_url, p_type, prior_title = fallback_targets[matched_norm]
 
         # Extract HTTP status code, duration, and redirected final URL
         crawl_obj = item.get("crawl") if isinstance(item.get("crawl"), dict) else {}
@@ -1506,7 +1756,7 @@ async def crawl_selected_pages(
         # Check HTTP error status
         if status_code is not None and status_code >= 400:
             err_msg = f"HTTP server error status {status_code}."
-            page_failures.append(
+            browser_failures.append(
                 FailedPageScrape(
                     url=orig_url,
                     error_message=err_msg,
@@ -1515,7 +1765,7 @@ async def crawl_selected_pages(
                 )
             )
             cat, reason = _categorize_error(err_msg, status_code)
-            diagnostics.append(
+            browser_diagnostics.append(
                 _PageDiagnostic(
                     requested_url=orig_url,
                     final_url=final_url,
@@ -1526,18 +1776,18 @@ async def crawl_selected_pages(
                     is_truncated=False,
                     error_category=cat,
                     error_reason=reason,
+                    retrieval_method="browser",
                 )
             )
             continue
 
-        # Extract content using best available representation (Fix 5)
+        # Extract content using best available representation
         raw_content = _extract_best_content(item)
-
         cleaned_text, is_blocked, is_truncated = _clean_page_content(raw_content)
 
         if is_blocked:
             err_msg = "Page access denied or bot challenge detected."
-            page_failures.append(
+            browser_failures.append(
                 FailedPageScrape(
                     url=orig_url,
                     error_message=err_msg,
@@ -1546,7 +1796,7 @@ async def crawl_selected_pages(
                 )
             )
             cat, reason = _categorize_error(err_msg, status_code)
-            diagnostics.append(
+            browser_diagnostics.append(
                 _PageDiagnostic(
                     requested_url=orig_url,
                     final_url=final_url,
@@ -1557,13 +1807,14 @@ async def crawl_selected_pages(
                     is_truncated=False,
                     error_category=cat,
                     error_reason=reason,
+                    retrieval_method="browser",
                 )
             )
             continue
 
         if len(cleaned_text) < MIN_PAGE_CONTENT_CHARS:
             err_msg = f"Extracted content is too short or empty ({len(cleaned_text)} characters)."
-            page_failures.append(
+            browser_failures.append(
                 FailedPageScrape(
                     url=orig_url,
                     error_message=err_msg,
@@ -1572,7 +1823,7 @@ async def crawl_selected_pages(
                 )
             )
             cat, reason = _categorize_error(err_msg, status_code)
-            diagnostics.append(
+            browser_diagnostics.append(
                 _PageDiagnostic(
                     requested_url=orig_url,
                     final_url=final_url,
@@ -1583,6 +1834,7 @@ async def crawl_selected_pages(
                     is_truncated=False,
                     error_category=cat,
                     error_reason=reason,
+                    retrieval_method="browser",
                 )
             )
             continue
@@ -1598,7 +1850,6 @@ async def crawl_selected_pages(
         if extracted_title:
             extracted_title = extracted_title.strip()
 
-        # Build ScrapedPage schema instance with honest HTTP status (Fix 6)
         scraped_page = ScrapedPage(
             url=orig_url,
             title=extracted_title,
@@ -1611,13 +1862,14 @@ async def crawl_selected_pages(
                 "char_count": len(cleaned_text),
                 "is_truncated": is_truncated,
                 "duration_seconds": item_duration,
+                "retrieval_method": "browser",
                 "actor_id": WEBSITE_CONTENT_CRAWLER_ACTOR_ID,
                 "description": metadata_obj.get("description"),
                 "language_code": metadata_obj.get("languageCode"),
             },
         )
-        scraped_pages.append(scraped_page)
-        diagnostics.append(
+        browser_scraped_pages.append(scraped_page)
+        browser_diagnostics.append(
             _PageDiagnostic(
                 requested_url=orig_url,
                 final_url=final_url,
@@ -1628,11 +1880,12 @@ async def crawl_selected_pages(
                 is_truncated=is_truncated,
                 error_category=None,
                 error_reason=None,
+                retrieval_method="browser",
             )
         )
 
-    # 7. Identify requested pages that were missing from dataset results
-    for norm_u, (orig_u, p_type, _) in valid_targets.items():
+    # 8. Identify requested fallback pages that were missing from dataset results
+    for norm_u, (orig_u, p_type, _) in fallback_targets.items():
         if norm_u not in processed_targets:
             if actor_final_status == "TIMED-OUT":
                 miss_err = "Page not scraped: crawler run timed out before completion."
@@ -1641,7 +1894,7 @@ async def crawl_selected_pages(
             else:
                 miss_err = "Page was not returned in the crawler dataset output."
 
-            page_failures.append(
+            browser_failures.append(
                 FailedPageScrape(
                     url=orig_u,
                     error_message=miss_err,
@@ -1649,7 +1902,7 @@ async def crawl_selected_pages(
                 )
             )
             cat, reason = _categorize_error(miss_err, None)
-            diagnostics.append(
+            browser_diagnostics.append(
                 _PageDiagnostic(
                     requested_url=orig_u,
                     final_url=orig_u,
@@ -1660,20 +1913,39 @@ async def crawl_selected_pages(
                     is_truncated=False,
                     error_category=cat,
                     error_reason=reason,
+                    retrieval_method="browser",
                 )
             )
 
-    # 8. Determine overall crawl status
+    # 9. Combine HTTP and Browser results
+    imm_diags = [
+        _PageDiagnostic(
+            requested_url=f.url,
+            final_url=f.url,
+            status="FAILED",
+            http_status=f.status_code,
+            duration_seconds=None,
+            char_count=0,
+            is_truncated=False,
+            error_category=_categorize_error(f.error_message, f.status_code)[0],
+            error_reason=_categorize_error(f.error_message, f.status_code)[1],
+            retrieval_method="http",
+        )
+        for f in immediate_failures
+    ]
+    scraped_pages = http_successes + browser_scraped_pages
+    page_failures = list(immediate_failures) + browser_failures
+    diagnostics = http_diagnostics + browser_diagnostics + imm_diags
+
     total_scraped = len(scraped_pages)
     total_failed = len(page_failures)
     has_usable_content = total_scraped > 0
 
     if total_scraped == total_requested and actor_final_status == "SUCCEEDED":
-        overall_status: Literal["success", "partial", "empty", "failed"] = "success"
+        overall_status = "success"
     elif total_scraped > 0:
         overall_status = "partial"
     else:
-        # Items were returned, but none produced usable content (all blocked or empty)
         overall_status = "empty" if any(f.error_message and "too short" in f.error_message for f in page_failures) else "failed"
 
     exec_time = round(time.perf_counter() - start_time, 2)
@@ -1693,12 +1965,14 @@ async def crawl_selected_pages(
     )
 
     logger.info(
-        "Website content crawler finished for %s: status=%s (actor_status=%s), scraped=%d/%d, failed=%d (time=%.2fs).",
+        "Website content crawler finished for %s: status=%s (actor_status=%s), scraped=%d/%d (http=%d, browser=%d), failed=%d (time=%.2fs).",
         resolved_website_url,
         overall_status,
         actor_final_status,
         total_scraped,
         total_requested,
+        len(http_successes),
+        len(browser_scraped_pages),
         total_failed,
         exec_time,
     )

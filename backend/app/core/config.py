@@ -90,6 +90,24 @@ class Settings(BaseSettings):
         le=10_000,
         description="Maximum pixel scroll height for triggering lazy-loaded homepage content (bounded to 0-10000).",
     )
+    HTTP_FIRST_RETRIEVAL: bool = Field(
+        default=True,
+        description="Whether to attempt fast HTTP retrieval before falling back to browser-based crawling.",
+    )
+    HTTP_RETRIEVAL_TIMEOUT_SECONDS: float = Field(
+        default=12.0,
+        ge=1.0,
+        le=60.0,
+        description="Timeout in seconds for direct HTTP fetch requests.",
+    )
+    MIN_PAGE_ADEQUACY_CHARS: int = Field(
+        default=50,
+        description="Minimum character threshold for general crawled page content to be considered adequate.",
+    )
+    MIN_HOMEPAGE_ADEQUACY_CHARS: int = Field(
+        default=50,
+        description="Minimum character threshold for homepage content to be considered adequate.",
+    )
     MAX_COMPETITORS: int = Field(
         default=5,
         description="Maximum total number of competitors to analyze.",

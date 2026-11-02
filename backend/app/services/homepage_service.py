@@ -24,11 +24,19 @@ import time
 import urllib.parse
 from typing import Any, Literal
 
+import httpx
 from apify_client import ApifyClient
 from apify_client.errors import ApifyApiError
 from pydantic import BaseModel, Field
 
 from backend.app.core.config import settings
+from backend.app.schemas.enums import PageType
+from backend.app.services.content_validation import (
+    extract_text_from_html,
+    is_blocked_content,
+    is_content_adequate,
+    log_http_response_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -578,7 +586,98 @@ async def _fetch_homepage_impl(
             execution_time_seconds=round(time.perf_counter() - start_time, 2),
         )
 
-    # --- 2. Validate Apify token ---
+    # --- 2. Attempt fast HTTP retrieval if enabled ---
+    if settings.HTTP_FIRST_RETRIEVAL:
+        http_timeout = min(float(timeout_seconds), settings.HTTP_RETRIEVAL_TIMEOUT_SECONDS)
+        http_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            logger.info("Attempting HTTP-first homepage fetch for %s...", normalized_url)
+            t_http_start = time.perf_counter()
+            async with httpx.AsyncClient(
+                timeout=http_timeout,
+                follow_redirects=True,
+                headers=http_headers,
+                verify=True,
+            ) as client:
+                resp = await client.get(normalized_url)
+                http_elapsed = round(time.perf_counter() - t_http_start, 2)
+                resp_text = resp.text or ""
+                final_u = str(resp.url)
+                resp_code = resp.status_code
+
+                if resp_code == 200 and resp_text:
+                    if _is_blocked_html(resp_text) or is_blocked_content(resp_text):
+                        logger.warning(
+                            "[HTTP_FIRST] Homepage %s received HTTP 200 but content indicates WAF/CAPTCHA challenge. "
+                            "Falling back to Playwright scraper.",
+                            normalized_url,
+                        )
+                    else:
+                        clean_txt = extract_text_from_html(resp_text)
+                        adequate, reason = is_content_adequate(
+                            clean_txt,
+                            url=final_u,
+                            page_type=PageType.HOME,
+                            min_chars=settings.MIN_HOMEPAGE_ADEQUACY_CHARS,
+                        )
+                        if adequate:
+                            logger.info(
+                                "[HTTP_FIRST] Homepage fetch succeeded via HTTP for %s -> %s "
+                                "(HTTP %d, %d HTML bytes, %d text chars) in %.2fs.",
+                                normalized_url,
+                                final_u,
+                                resp_code,
+                                len(resp_text),
+                                len(clean_txt),
+                                http_elapsed,
+                            )
+                            return HomepageFetchResult(
+                                requested_url=normalized_url,
+                                final_url=final_u,
+                                html=resp_text,
+                                http_status_code=resp_code,
+                                status="success",
+                                actor_run_id=None,
+                                execution_time_seconds=http_elapsed,
+                            )
+                        else:
+                            logger.warning(
+                                "[HTTP_FIRST] Homepage %s returned inadequate content (%s, %d text chars). "
+                                "Falling back to Playwright scraper.",
+                                normalized_url,
+                                reason,
+                                len(clean_txt),
+                            )
+                else:
+                    log_http_response_diagnostics(
+                        resp,
+                        stage="homepage",
+                        duration_seconds=http_elapsed,
+                        logger_instance=logger,
+                    )
+                    logger.warning(
+                        "[HTTP_FIRST] Homepage %s HTTP request returned status %d. "
+                        "Falling back to Playwright scraper.",
+                        normalized_url,
+                        resp_code,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "[HTTP_FIRST] HTTP fetch failed for homepage %s (%s: %s). "
+                "Falling back to Playwright scraper.",
+                normalized_url,
+                type(exc).__name__,
+                exc,
+            )
+
+    # --- 3. Validate Apify token for browser fallback ---
     if not settings.APIFY_API_TOKEN:
         return HomepageFetchResult(
             requested_url=normalized_url,
