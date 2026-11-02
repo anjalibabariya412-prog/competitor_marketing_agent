@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 # Canonical model identifier for structured page selection (configured via settings.LLM_MODEL)
 PAGE_SELECTION_MODEL: str = settings.LLM_MODEL
 
-# Default maximum number of pages to select for competitive analysis
-DEFAULT_MAX_SELECTED_PAGES: int = 10
+# Default maximum number of pages to select for competitive analysis (configured via settings.MAX_PAGES_USER_SITE)
+DEFAULT_MAX_SELECTED_PAGES: int = getattr(settings, "MAX_PAGES_USER_SITE", 6)
 
 # Upper bound on candidate URLs sent to LLM prompt to keep latency and token costs minimal
 MAX_PROMPT_CANDIDATES: int = 60
@@ -72,12 +72,13 @@ class SelectionCategory(str, Enum):
 
 
 PAGE_TYPE_PRIORITY: dict[PageType, int] = {
-    PageType.PRICING: 100,
+     PageType.HOME: 100,
+    PageType.HOME: 100,
+    PageType.PRICING: 95,
     PageType.PRODUCT: 90,
     PageType.SERVICE: 90,
     PageType.OFFER: 85,
     PageType.ABOUT: 80,
-    PageType.HOME: 75,
     PageType.CONTACT: 70,
     PageType.FAQ: 65,
     PageType.BLOG: 35,
@@ -313,6 +314,7 @@ def select_pages_deterministic(
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     base_url: str = "",
     product_or_service: str | None = None,
+    exclude_homepage: bool = False,
 ) -> PageSelectionResult:
     """Deterministically select a balanced, representative set of up to `max_pages` candidate URLs.
 
@@ -360,6 +362,14 @@ def select_pages_deterministic(
     # 2. Extract product relevance parameters
     keywords = extract_product_keywords(product_or_service) if product_or_service else []
     product_phrase = product_or_service.strip() if product_or_service else ""
+
+    # If exclude_homepage is True, exclude homepage candidates to prevent duplicate scraping
+    if exclude_homepage:
+        unique_candidates = [
+            c for c in unique_candidates
+            if categorize_candidate(c, base_url=base_url) != SelectionCategory.HOME
+        ]
+
     has_matches = any(calculate_product_relevance(c, keywords, product_phrase) > 0 for c in unique_candidates)
 
     # 3. Categorize all unique candidates
@@ -751,6 +761,7 @@ async def select_pages_with_llm(
     max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
     model: str | None = None,
     force_llm: bool = False,
+    exclude_homepage: bool = False,
 ) -> PageSelectionResult:
     """Select a balanced set of up to `max_pages` relevant candidate URLs.
 
@@ -787,12 +798,28 @@ async def select_pages_with_llm(
             error_message="Candidate list is empty; no pages to select.",
         )
 
+    # If exclude_homepage is True, filter out homepage candidates before selection
+    clean_base = website_url.lower().rstrip("/") if website_url else ""
+    if exclude_homepage:
+        candidates = [
+            c for c in candidates
+            if categorize_candidate(c, base_url=clean_base) != SelectionCategory.HOME
+        ]
+        if not candidates:
+            return PageSelectionResult(
+                selected_pages=[],
+                total_selected=0,
+                selection_method="empty",
+                error_message="All candidates were homepage URLs and exclude_homepage=True.",
+            )
+
     # 1. Primary Selection: Run deterministic prioritization first
     deterministic_result = select_pages_deterministic(
         candidates,
         max_pages=max_pages,
         base_url=website_url,
         product_or_service=product_or_service,
+        exclude_homepage=exclude_homepage,
     )
 
     # 2. Check if selection is ambiguous and an LLM fallback call is justified
@@ -884,7 +911,7 @@ async def select_pages_with_llm(
         parsed_response: StructuredPageSelectionResponse | None = completion.choices[0].message.parsed
         if parsed_response is None or not parsed_response.selected_pages:
             logger.warning("OpenAI model returned empty structured selection; using deterministic fallback.")
-            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
+            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service, exclude_homepage=exclude_homepage)
             res.error_message = "OpenAI returned an empty selection response."
             return res
 
@@ -924,18 +951,19 @@ async def select_pages_with_llm(
 
         if not validated_pages:
             logger.warning("No LLM-selected URLs passed candidate membership validation; using fallback.")
-            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
+            res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service, exclude_homepage=exclude_homepage)
             res.error_message = "All LLM-selected URLs failed candidate membership validation."
             return res
 
         # 6. Post-LLM Balancing & Slot Backfilling
-        # Check if homepage candidate existed but was omitted by LLM
+        # Check if homepage candidate existed but was omitted by LLM (only if exclude_homepage is False)
         clean_base = website_url.lower().rstrip("/") if website_url else ""
         home_candidate: CandidateURL | None = None
-        for c in candidates:
-            if categorize_candidate(c, base_url=clean_base) == SelectionCategory.HOME:
-                home_candidate = c
-                break
+        if not exclude_homepage:
+            for c in candidates:
+                if categorize_candidate(c, base_url=clean_base) == SelectionCategory.HOME:
+                    home_candidate = c
+                    break
 
         if home_candidate is not None:
             home_norm = home_candidate.url.lower().rstrip("/")
@@ -975,6 +1003,7 @@ async def select_pages_with_llm(
                 max_pages=max_pages,
                 base_url=website_url,
                 product_or_service=product_or_service,
+                exclude_homepage=exclude_homepage,
             )
             for fb_page in fallback_res.selected_pages:
                 if len(validated_pages) >= max_pages:
@@ -1004,7 +1033,7 @@ async def select_pages_with_llm(
             type(exc).__name__,
             exc,
         )
-        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service)
+        res = select_pages_deterministic(candidates, max_pages=max_pages, base_url=website_url, product_or_service=product_or_service, exclude_homepage=exclude_homepage)
         res.error_message = f"OpenAI call failed ({type(exc).__name__}: {exc}); deterministic fallback used."
         return res
 

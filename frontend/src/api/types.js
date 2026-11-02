@@ -47,15 +47,6 @@
  */
 
 /**
- * @typedef {Object} RawKeyFinding
- * @property {string} statement
- * @property {string} [finding_type]
- * @property {string|null} [source_url]
- * @property {boolean} [is_inferred]
- * @property {boolean} [has_conflict]
- */
-
-/**
  * @typedef {Object} RawBusinessOverview
  * @property {string} [business_name]
  * @property {string} website_url
@@ -65,7 +56,6 @@
  * @property {RawValueProposition[]} [positioning_and_value_propositions]
  * @property {string[]} [conflicts]
  * @property {RawInformationGap[]} [information_gaps]
- * @property {RawKeyFinding[]} [key_findings]
  * @property {string[]} [sources_used]
  */
 

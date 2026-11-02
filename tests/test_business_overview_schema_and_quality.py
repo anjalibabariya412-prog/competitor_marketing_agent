@@ -112,7 +112,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                     source_url="https://aura-skincare.example.com/",
                 )
             ],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -139,7 +138,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="General consumers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -173,7 +171,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="Consumers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -207,7 +204,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="Consumers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -239,7 +235,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="Skincare seekers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -298,7 +293,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="DevOps engineers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -333,7 +327,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="Consumers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -363,7 +356,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="Corporate teams", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -386,7 +378,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                 source_url="https://aura-skincare.example.com/",
             ),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -413,7 +404,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                 is_explicit=False,
             ),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -436,7 +426,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             ],
             target_audience=TargetAudienceInfo(description="Consumers", is_explicit=False),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -471,14 +460,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                     source_urls=["https://hallucinated-store.com/fake-vp"],
                 )
             ],
-            key_findings=[
-                Finding(
-                    statement="Award winner in 2026 named best serum.",
-                    finding_type=FindingType.STRENGTH,
-                    source_url="https://hallucinated-store.com/fake-awards",
-                    source_urls=["https://hallucinated-store.com/fake-awards"],
-                )
-            ],
             sources_used=[],
         )
 
@@ -487,7 +468,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
         self.assertEqual(sanitized.products_and_services[0].source_urls, [])
         self.assertIsNone(sanitized.positioning_and_value_propositions[0].source_url)
         self.assertEqual(sanitized.positioning_and_value_propositions[0].source_urls, [])
-        self.assertEqual(len(sanitized.key_findings), 0)
         self.assertEqual(sanitized.sources_used, [])
 
     # --- Scenario 13: Valid source URLs with harmless formatting differences resolved ---
@@ -513,7 +493,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                     source_url="https://aura-skincare.example.com",  # Missing trailing slash compared to homepage
                 )
             ],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -542,11 +521,10 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             business_description="Multi-source finding overview.",
             products_and_services=[],
             target_audience=TargetAudienceInfo(description="Consumers", is_explicit=False),
-            positioning_and_value_propositions=[],
-            key_findings=[
-                Finding(
+            positioning_and_value_propositions=[
+                ValueProposition(
                     statement="All serums are vegan and 100% cruelty-free botanical skincare.",
-                    finding_type=FindingType.POSITIONING,
+                    is_explicit=True,
                     source_url="https://aura-skincare.example.com/",
                     source_urls=[
                         "https://aura-skincare.example.com/",
@@ -558,11 +536,11 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
         )
 
         sanitized = _sanitize_and_validate_overview(overview, self.crawled_pages, self.sample_form)
-        self.assertEqual(len(sanitized.key_findings), 1)
-        finding = sanitized.key_findings[0]
-        self.assertEqual(len(finding.source_urls), 2)
-        self.assertIn("https://aura-skincare.example.com/", finding.source_urls)
-        self.assertIn("https://aura-skincare.example.com/collections/serums", finding.source_urls)
+        self.assertEqual(len(sanitized.positioning_and_value_propositions), 1)
+        vp = sanitized.positioning_and_value_propositions[0]
+        self.assertEqual(len(vp.source_urls), 2)
+        self.assertIn("https://aura-skincare.example.com/", vp.source_urls)
+        self.assertIn("https://aura-skincare.example.com/collections/serums", vp.source_urls)
         self.assertIn("https://aura-skincare.example.com/", sanitized.sources_used)
         self.assertIn("https://aura-skincare.example.com/collections/serums", sanitized.sources_used)
 
@@ -588,7 +566,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                 source_url="https://aura-skincare.example.com/",
             ),
             positioning_and_value_propositions=[],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -618,12 +595,11 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             positioning_and_value_propositions=[
                 ValueProposition(statement="High purity ingredients", is_explicit=False)
             ],
-            key_findings=[],
             sources_used=[],
         )
 
         sanitized = _sanitize_and_validate_overview(minimal_overview, self.crawled_pages, self.sample_form)
-        self.assertEqual(sanitized.products_and_services[0].offering_type, OfferingType.PRODUCT)
+        self.assertEqual(sanitized.products_and_services[0].offering_type, OfferingType.COLLECTION)
         self.assertIsNone(sanitized.products_and_services[0].pricing)
         self.assertEqual(sanitized.products_and_services[0].variants, [])
         self.assertEqual(sanitized.products_and_services[0].source_urls, [])
@@ -632,29 +608,28 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
 
     # --- Scenario 17: Existing valid findings surviving sanitization ---
     def test_17_valid_findings_survive_sanitization(self) -> None:
-        """Verify legitimate findings with exact quotes and verified URLs are preserved."""
+        """Verify legitimate claims with verified URLs are preserved."""
         overview = BusinessOverview(
             business_name="Aura Skincare",
             website_url="https://aura-skincare.example.com",
-            business_description="Overview with valid finding.",
-            products_and_services=[],
-            target_audience=TargetAudienceInfo(description="Urban professionals", is_explicit=False),
-            positioning_and_value_propositions=[],
-            key_findings=[
-                Finding(
-                    statement="Deep moisture barrier serum offers daily hydration.",
-                    finding_type=FindingType.PRODUCT_SERVICE,
+            business_description="Overview with valid claim.",
+            products_and_services=[
+                ProductServiceItem(
+                    name="Hydrating Serum",
+                    description="Deep moisture barrier serum offers daily hydration.",
                     source_url="https://aura-skincare.example.com/products/hydrating-serum",
                 )
             ],
+            target_audience=TargetAudienceInfo(description="Urban professionals", is_explicit=False),
+            positioning_and_value_propositions=[],
             sources_used=[],
         )
 
         sanitized = _sanitize_and_validate_overview(overview, self.crawled_pages, self.sample_form)
-        self.assertEqual(len(sanitized.key_findings), 1)
-        self.assertEqual(sanitized.key_findings[0].statement, "Deep moisture barrier serum offers daily hydration.")
+        self.assertEqual(len(sanitized.products_and_services), 1)
+        self.assertEqual(sanitized.products_and_services[0].name, "Hydrating Serum")
         self.assertEqual(
-            sanitized.key_findings[0].source_url,
+            sanitized.products_and_services[0].source_url,
             "https://aura-skincare.example.com/products/hydrating-serum",
         )
         self.assertIn("https://aura-skincare.example.com/products/hydrating-serum", sanitized.sources_used)
@@ -703,14 +678,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                 ValueProposition(
                     statement="Botanical pollution defense",
                     is_explicit=True,
-                    source_url="https://aura-skincare.example.com/",
-                    source_urls=["https://aura-skincare.example.com/"],
-                )
-            ],
-            key_findings=[
-                Finding(
-                    statement="Plant-based formulations defending against pollution.",
-                    finding_type=FindingType.POSITIONING,
                     source_url="https://aura-skincare.example.com/",
                     source_urls=["https://aura-skincare.example.com/"],
                 )
@@ -813,7 +780,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                     observation="Current prices for these concealers are not listed on the reviewed product pages.",
                 )
             ],
-            key_findings=[],
             sources_used=[],
             conflicts=[],
         )

@@ -67,11 +67,11 @@ class Settings(BaseSettings):
         description="Scraper provider to use. Structured for future provider additions.",
     )
     MAX_PAGES_USER_SITE: int = Field(
-        default=10,
-        description="Maximum number of pages to scrape from the user's own website.",
+        default=6,
+        description="Maximum number of pages to scrape from the user's own website (1 homepage + up to 5 related pages).",
     )
     MAX_PAGES_PER_COMPETITOR: int = Field(
-        default=10,
+        default=6,
         description="Maximum number of pages to scrape per competitor site.",
     )
     CRAWLER_ACTOR_TIMEOUT_SECONDS: int = Field(

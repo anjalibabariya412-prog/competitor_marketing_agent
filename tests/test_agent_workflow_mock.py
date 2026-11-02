@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 from backend.app.agent.graph import create_graph, get_graph, graph
 from backend.app.agent.state import AgentState
+from backend.app.core.config import settings
 from backend.app.schemas.business_form import BusinessForm
 from backend.app.schemas.enums import FindingType, PageType
 from backend.app.schemas.scraped_data import Finding, ScrapedPage
@@ -248,20 +249,6 @@ def _create_sample_overview_result() -> tuple[BusinessOverviewResult, BusinessOv
                 observation="Website does not specify physical retail stockists or in-store distribution partners.",
             ),
         ],
-        key_findings=[
-            Finding(
-                statement="Active Peptide Serum priced at $58.00; Hydra-Barrier Cream priced at $48.00.",
-                finding_type=FindingType.PRICING,
-                source_url="https://www.luminabotanicals.com/pricing",
-                is_inferred=False,
-            ),
-            Finding(
-                statement="All products are Leaping Bunny certified cruelty-free and free of synthetic fragrance.",
-                finding_type=FindingType.POSITIONING,
-                source_url="https://www.luminabotanicals.com/about",
-                is_inferred=False,
-            ),
-        ],
         sources_used=[
             "https://www.luminabotanicals.com/about",
             "https://www.luminabotanicals.com/pricing",
@@ -356,10 +343,12 @@ class TestAgentWorkflowMock(unittest.IsolatedAsyncioTestCase):
                 candidates=candidate_urls,
                 website_url="https://www.luminabotanicals.com",
                 product_or_service=business_form.product_or_service,
+                max_pages=settings.MAX_PAGES_USER_SITE,
             )
             patch_crawl.assert_awaited_once_with(
                 pages=selected_pages,
                 website_url="https://www.luminabotanicals.com",
+                max_pages=settings.MAX_PAGES_USER_SITE,
             )
             patch_overview.assert_awaited_once_with(
                 crawl_input=crawl_result,

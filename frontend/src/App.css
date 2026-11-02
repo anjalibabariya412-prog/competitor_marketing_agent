@@ -546,6 +546,192 @@
   margin: 0 0 var(--space-6) 0;
 }
 
+/* Step Progress List (Live Backend Pipeline Stepper) */
+.progress-stepper-container {
+  width: 100%;
+  max-width: 420px;
+  margin: var(--space-2) auto var(--space-5);
+  text-align: left;
+}
+
+.progress-stepper-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.progress-step-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  position: relative;
+}
+
+.progress-step-indicator-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+  align-self: stretch;
+}
+
+.step-icon-badge {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-full);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  transition: all 0.2s ease;
+}
+
+.step-badge-done {
+  background-color: var(--color-success-bg);
+  border: 1.5px solid var(--color-success);
+  color: var(--color-success);
+}
+
+.step-check-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--color-success);
+}
+
+.step-badge-running {
+  background-color: var(--color-pale-blue);
+  border: 1.5px solid var(--color-primary-blue);
+  color: var(--color-primary-blue);
+  box-shadow: 0 0 0 3px rgba(49, 94, 251, 0.12);
+}
+
+.step-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--color-pale-blue-border);
+  border-top-color: var(--color-primary-blue);
+  border-radius: 50%;
+  animation: spinnerRotate 0.85s linear infinite;
+  box-sizing: border-box;
+}
+
+.step-badge-pending {
+  background-color: var(--bg-surface-subtle);
+  border: 1.5px solid var(--border-subtle);
+}
+
+.step-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--text-muted);
+}
+
+.progress-step-line {
+  width: 2px;
+  flex: 1;
+  min-height: 22px;
+  background-color: var(--border-subtle);
+  margin: 3px 0;
+  transition: background-color 0.25s ease;
+}
+
+.progress-step-line-done {
+  background-color: var(--color-success);
+}
+
+.progress-step-content {
+  flex: 1;
+  padding-bottom: var(--space-4);
+  min-width: 0;
+}
+
+.progress-step-item:last-child .progress-step-content {
+  padding-bottom: var(--space-2);
+}
+
+.progress-step-label-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 24px;
+}
+
+.progress-step-label {
+  font-family: var(--font-heading);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: 1.4;
+  transition: color 0.2s ease;
+}
+
+.progress-step-label-done {
+  color: var(--color-midnight);
+}
+
+.progress-step-label-running {
+  color: var(--color-primary-blue);
+  font-weight: 700;
+}
+
+.progress-step-label-pending {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.step-badge-tag-running {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-primary-blue);
+  background-color: var(--color-pale-blue);
+  border: 1px solid var(--color-pale-blue-border);
+  padding: 1px 6px;
+  border-radius: 4px;
+  display: inline-block;
+  line-height: 1.4;
+}
+
+.progress-step-detail {
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  margin: 3px 0 0 0;
+  word-break: break-word;
+}
+
+.progress-step-detail-running {
+  color: var(--text-secondary);
+  animation: stepDetailFadeIn 0.25s ease;
+}
+
+.progress-step-detail-done {
+  color: var(--text-muted);
+}
+
+@keyframes stepDetailFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .step-spinner {
+    animation: spinnerPulse 1.8s ease-in-out infinite;
+  }
+  .progress-step-detail-running {
+    animation: none;
+  }
+}
+
 .loading-meta-dock {
   width: 100%;
   display: flex;
@@ -997,7 +1183,7 @@
   margin: 0;
 }
 
-/* Numbered Items Stack (Positioning & Key Findings) */
+/* Numbered Items Stack (Positioning) */
 .numbered-items-stack {
   display: flex;
   flex-direction: column;

@@ -53,9 +53,6 @@ test('adaptBusinessOverview adapts response with fallback handling', () => {
       ],
       information_gaps: [
         { category: 'Pricing', observation: 'Wholesale tiers not published.' }
-      ],
-      key_findings: [
-        { statement: 'Free shipping on orders over 499', is_inferred: false, has_conflict: false, source_url: 'https://swissbeauty.in' }
       ]
     }
   };

@@ -141,11 +141,15 @@ async def business_overview_node(state: AgentState) -> dict[str, Any]:
 
     # 5. Call existing business overview service
     try:
-        overview_result = await generate_business_overview(
-            crawl_input=crawl_input,
-            website_url=clean_url or None,
-            business_form=business_form,
-        )
+        bo_kwargs: dict[str, Any] = {
+            "crawl_input": crawl_input,
+            "website_url": clean_url or None,
+            "business_form": business_form,
+        }
+        if state.get("on_progress") is not None:
+            bo_kwargs["on_progress"] = state["on_progress"]
+
+        overview_result = await generate_business_overview(**bo_kwargs)
     except Exception as exc:
         logger.exception("Unexpected exception in business overview service for '%s': %s", clean_url, exc)
         error_msg = f"Business overview generation failed unexpectedly for '{clean_url}': {exc}"
@@ -189,9 +193,8 @@ async def business_overview_node(state: AgentState) -> dict[str, Any]:
 
     # 7. Successful generation
     logger.info(
-        "Business Overview Node completed successfully for '%s': %d findings, %d products analyzed.",
+        "Business Overview Node completed successfully for '%s': %d products analyzed.",
         clean_url,
-        overview_result.total_findings,
         len(overview_result.business_overview.products_and_services),
     )
 

@@ -7,7 +7,7 @@ evidence-based business overview generation.
 
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from backend.app.schemas.business_form import BusinessForm
 from backend.app.schemas.scraped_data import ScrapedPage
@@ -88,7 +88,7 @@ class AgentState(TypedDict, total=False):
     # Complete result from LLM-based business overview generation
     overview_result: BusinessOverviewResult | None
 
-    # Generated evidence-based overview, offerings, audience, and key findings
+    # Generated evidence-based overview, offerings, and audience
     business_overview: BusinessOverview | None
 
     # ---------------------------------------------------------------------------
@@ -105,6 +105,9 @@ class AgentState(TypedDict, total=False):
 
     # Cumulative list of non-fatal warnings or diagnostic error messages
     errors: list[str] | None
+
+    # Optional callback for streaming real-time stage progress updates
+    on_progress: Any
 
 
 __all__ = ["AgentState"]

@@ -306,13 +306,6 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
                     source_url="https://store.example.com/fake-value-prop",
                 )
             ],
-            key_findings=[
-                Finding(
-                    statement="Fabricated warranty statement",
-                    finding_type=FindingType.POSITIONING,
-                    source_url="https://store.example.com/invented-warranty",
-                )
-            ],
             sources_used=["https://store.example.com/invented-warranty"],
         )
 
@@ -330,9 +323,7 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         # 3. Value proposition un-crawled source set to None, and is_explicit downgraded to False
         self.assertIsNone(sanitized.positioning_and_value_propositions[0].source_url)
         self.assertFalse(sanitized.positioning_and_value_propositions[0].is_explicit)
-        # 4. Finding citing unverified URL is DROPPED
-        self.assertEqual(len(sanitized.key_findings), 0)
-        # 5. sources_used does NOT contain the invented warranty page
+        # 4. sources_used does NOT contain the invented warranty page
         self.assertEqual(sanitized.sources_used, [])
 
     def test_10_harmless_url_formatting_differences_resolved(self):
@@ -372,13 +363,6 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
                     source_url="http://example.com/pricing/",  # http scheme, trailing slash
                 )
             ],
-            key_findings=[
-                Finding(
-                    statement="Annual plan includes 2 months free",
-                    finding_type=FindingType.PRICING,
-                    source_url="https://www.example.com/pricing",  # No query parameter
-                )
-            ],
             sources_used=["https://example.com/pricing"],
         )
 
@@ -392,8 +376,6 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sanitized.products_and_services[0].source_url, original_crawled_url)
         self.assertEqual(sanitized.products_and_services[1].source_url, original_crawled_url)
         self.assertEqual(sanitized.positioning_and_value_propositions[0].source_url, original_crawled_url)
-        self.assertEqual(len(sanitized.key_findings), 1)
-        self.assertEqual(sanitized.key_findings[0].source_url, original_crawled_url)
         self.assertEqual(sanitized.sources_used, [original_crawled_url])
 
     def test_11_unsupported_claims_not_retained_as_explicit_facts(self):
@@ -430,23 +412,21 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(sanitized.positioning_and_value_propositions[0].is_explicit)
         self.assertIsNone(sanitized.positioning_and_value_propositions[0].source_url)
 
-    def test_12_valid_findings_not_unnecessarily_discarded(self):
-        """Scenario 12: Valid findings citing legitimately crawled pages are strictly retained."""
+    def test_12_valid_claims_not_unnecessarily_discarded(self):
+        """Scenario 12: Valid claims citing legitimately crawled pages are strictly retained."""
         page1 = "https://dental.example.com/services/ortho"
         page2 = "https://dental.example.com/pricing"
         supplied_pages = [page1, page2]
 
-        finding1 = Finding(
+        vp1 = ValueProposition(
             statement="Invisalign treatment plans start at $3,500 with zero down.",
-            finding_type=FindingType.PRICING,
+            is_explicit=True,
             source_url=page2,
-            is_inferred=False,
         )
-        finding2 = Finding(
+        vp2 = ValueProposition(
             statement="Offers weekend orthodontic adjustment consultations.",
-            finding_type=FindingType.PRODUCT_SERVICE,
+            is_explicit=True,
             source_url=page1,
-            is_inferred=False,
         )
 
         raw_overview = BusinessOverview(
@@ -454,7 +434,7 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
             website_url="https://dental.example.com",
             business_description="Dental care",
             target_audience=TargetAudienceInfo(description="Families", is_explicit=False),
-            key_findings=[finding1, finding2],
+            positioning_and_value_propositions=[vp1, vp2],
         )
 
         sanitized = _sanitize_and_validate_overview(
@@ -463,9 +443,9 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
             fallback_website_url="https://dental.example.com",
         )
 
-        self.assertEqual(len(sanitized.key_findings), 2)
-        self.assertEqual(sanitized.key_findings[0].statement, finding1.statement)
-        self.assertEqual(sanitized.key_findings[1].statement, finding2.statement)
+        self.assertEqual(len(sanitized.positioning_and_value_propositions), 2)
+        self.assertEqual(sanitized.positioning_and_value_propositions[0].statement, vp1.statement)
+        self.assertEqual(sanitized.positioning_and_value_propositions[1].statement, vp2.statement)
         self.assertIn(page1, sanitized.sources_used)
         self.assertIn(page2, sanitized.sources_used)
 
@@ -486,7 +466,6 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
                     observation="Public website does not list product pricing or minimum order quantities (MOQ).",
                 )
             ],
-            key_findings=[],
             sources_used=[],
         )
 
@@ -550,20 +529,11 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
                     statement="Predictable flat-fee pricing model for early startups",
                     is_explicit=True,
                     source_url="https://legal.example.com/pricing",
-                )
-            ],
-            key_findings=[
-                Finding(
-                    statement="Trademark registration package is offered at $1,200 flat fee.",
-                    finding_type=FindingType.PRICING,
-                    source_url="https://legal.example.com/pricing",
-                    is_inferred=False,
                 ),
-                Finding(
+                ValueProposition(
                     statement="Free initial IP audits offered to Y Combinator batches.",
-                    finding_type=FindingType.OFFER,
+                    is_explicit=True,
                     source_url="https://legal.example.com/fabricated-yc-offer",  # Hallucinated URL
-                    is_inferred=False,
                 ),
             ],
             sources_used=["https://legal.example.com/pricing"],
@@ -589,11 +559,11 @@ class TestLLMInputAndEvidenceFlow(unittest.IsolatedAsyncioTestCase):
             overview = result.business_overview
             self.assertIsNotNone(overview)
 
-            # Valid finding was retained
-            self.assertEqual(len(overview.key_findings), 1)
-            self.assertEqual(overview.key_findings[0].source_url, "https://legal.example.com/pricing")
-            # Fabricated finding citing un-crawled URL was dropped
-            self.assertFalse(any("fabricated-yc-offer" in f.source_url for f in overview.key_findings))
+            # Valid VP source was retained
+            self.assertEqual(overview.positioning_and_value_propositions[0].source_url, "https://legal.example.com/pricing")
+            # Fabricated VP source citing un-crawled URL was cleared
+            self.assertIsNone(overview.positioning_and_value_propositions[1].source_url)
+            self.assertFalse(overview.positioning_and_value_propositions[1].is_explicit)
 
             # User intake audience preserved
             self.assertIn('Early-stage tech founders', overview.target_audience.description)

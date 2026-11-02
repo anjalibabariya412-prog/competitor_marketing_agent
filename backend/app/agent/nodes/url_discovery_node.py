@@ -14,6 +14,7 @@ final page set without issuing a second network request.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -154,6 +155,14 @@ async def url_discovery_node(state: AgentState) -> dict[str, Any]:
 
     clean_url = website_url.strip()
     logger.info("URL Discovery Node processing business website: %s", clean_url)
+    on_progress = state.get("on_progress")
+    if on_progress:
+        try:
+            res = on_progress("visiting_website", f"Connecting to {clean_url}...", {"website_url": clean_url})
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            pass
 
     # 3. Call existing URL discovery orchestrator
     try:

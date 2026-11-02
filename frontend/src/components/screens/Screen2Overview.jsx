@@ -51,7 +51,6 @@ export function Screen2Overview({ rawResponse, onBack }) {
     products,
     audience,
     positioning,
-    findings,
     sourcesUsed,
     pageCount,
     totalPagesAnalyzed,
@@ -84,31 +83,18 @@ export function Screen2Overview({ rawResponse, onBack }) {
       });
     }
 
-    // 4. Key findings sources
-    if (Array.isArray(findings)) {
-      findings.forEach((finding) => {
-        addUrl(finding.provenance?.sourceUrl);
-      });
-    }
-
-    // 5. Products / offerings sources
+    // 4. Products / offerings sources
     if (Array.isArray(products)) {
       products.forEach((prod) => {
         addUrl(prod.provenance?.sourceUrl);
       });
     }
 
-    // 6. Direct fallback from rawResponse if present
+    // 5. Direct fallback from rawResponse if present
     const rawOverview = rawResponse?.business_overview;
     if (rawOverview) {
       if (Array.isArray(rawOverview.sources_used)) {
         rawOverview.sources_used.forEach(addUrl);
-      }
-      if (Array.isArray(rawOverview.key_findings)) {
-        rawOverview.key_findings.forEach((f) => {
-          addUrl(f.source_url);
-          if (Array.isArray(f.source_urls)) f.source_urls.forEach(addUrl);
-        });
       }
       if (Array.isArray(rawOverview.positioning_and_value_propositions)) {
         rawOverview.positioning_and_value_propositions.forEach((vp) => {
@@ -128,7 +114,7 @@ export function Screen2Overview({ rawResponse, onBack }) {
     }
 
     return Array.from(urlSet);
-  }, [sourcesUsed, audience, positioning, findings, products, rawResponse]);
+  }, [sourcesUsed, audience, positioning, products, rawResponse]);
 
   const actualPageCount =
     (typeof totalPagesAnalyzed === 'number' && totalPagesAnalyzed > 0)
@@ -247,7 +233,7 @@ export function Screen2Overview({ rawResponse, onBack }) {
         <section className="overview-report-section">
           <div className="panel-title-bar">
             <div>
-              <h2 className="panel-heading">How You Position Yourself</h2>
+              <h2 className="panel-heading">Positioning of Your Business</h2>
               <p className="panel-subheading">Key positioning claims, value propositions, and market differentiators.</p>
             </div>
           </div>
@@ -295,38 +281,7 @@ export function Screen2Overview({ rawResponse, onBack }) {
           </div>
         </section>
 
-        {/* Section 5: Key Findings */}
-        <section className="overview-report-section">
-          <div className="panel-title-bar">
-            <div>
-              <h2 className="panel-heading">Key Findings</h2>
-              <p className="panel-subheading">Significant additional business-level observations not covered in the sections above.</p>
-            </div>
-          </div>
-
-          {findings && findings.length > 0 ? (
-            <div className="numbered-items-stack findings-stack">
-              {findings.map((finding, idx) => (
-                <div key={finding.id || idx} className="numbered-item-row finding-row">
-                  <span className="bullet-indicator" aria-hidden="true" />
-                  <div className="numbered-item-content">
-                    <p className="numbered-item-text">{finding.statement}</p>
-                    {finding.provenance?.hasConflict && (
-                      <div className="conflict-notice-pill">
-                        <ShieldAlertIcon size="sm" />
-                        <span>Conflicting information detected on site</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="empty-panel-text">No additional findings reported.</p>
-          )}
-        </section>
-
-        {/* 6. Collapsible Key Sources Row */}
+        {/* 5. Collapsible Key Sources Row */}
         {keySources.length > 0 && (
           <div className="key-sources-collapsible">
             <button

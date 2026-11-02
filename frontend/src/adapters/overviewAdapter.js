@@ -143,26 +143,7 @@ export function adaptBusinessOverview(rawResponse) {
     };
   }).filter((item) => Boolean(item.statement));
 
-  // 4. Key findings
-  const rawFindings = Array.isArray(overview.key_findings) ? overview.key_findings : [];
-  const findings = rawFindings.map((f, idx) => {
-    if (typeof f === 'string') {
-      return {
-        id: `find_${idx}`,
-        statement: f,
-        type: 'general',
-        provenance: deriveProvenance({}),
-      };
-    }
-    return {
-      id: `find_${idx}`,
-      statement: f.statement || '',
-      type: f.finding_type || 'insight',
-      provenance: deriveProvenance(f),
-    };
-  }).filter((f) => Boolean(f.statement));
-
-  // 5. What we couldn't find (Information gaps - gentle notice)
+  // 4. What we couldn't find (Information gaps - gentle notice)
   const rawGaps = Array.isArray(overview.information_gaps) ? overview.information_gaps : [];
   const informationGaps = rawGaps.map((g, idx) => {
     if (typeof g === 'string') {
@@ -189,7 +170,6 @@ export function adaptBusinessOverview(rawResponse) {
     products,
     audience,
     positioning,
-    findings,
     informationGaps,
     sourcesUsed,
   };

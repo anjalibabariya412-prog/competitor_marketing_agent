@@ -14,16 +14,35 @@ from typing import Any
 import urllib.parse
 
 from ..state import AgentState
+from backend.app.core.config import settings
 from backend.app.schemas.business_form import BusinessForm
+from backend.app.schemas.scraped_data import ScrapedPage
 from backend.app.services.page_selection_service import (
     PageSelectionResult,
     SelectedPage,
+    SelectionCategory,
+    categorize_candidate,
     select_pages_with_llm,
 )
 from backend.app.services.sitemap_fallback_service import WebsiteURLDiscoveryResult
 from backend.app.services.url_extractor_service import CandidateURL
+from backend.app.services.website_content_crawler_service import MIN_PAGE_CONTENT_CHARS
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_url_for_merge(url: str) -> str:
+    """Normalize URL for deduplication and comparison with homepage."""
+    cleaned = url.strip().lower().rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(cleaned)
+        netloc = parsed.netloc
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = parsed.path.rstrip("/")
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, path, parsed.query, ""))
+    except Exception:
+        return cleaned
 
 
 async def page_selection_node(state: AgentState) -> dict[str, Any]:
@@ -133,12 +152,60 @@ async def page_selection_node(state: AgentState) -> dict[str, Any]:
     elif isinstance(business_form, dict):
         product_or_service = business_form.get("product_or_service")
 
+    # 4. Check if homepage content is already available and valid
+    homepage_scraped_page: ScrapedPage | None = state.get("homepage_scraped_page")  # type: ignore[assignment]
+    is_homepage_reusable = (
+        homepage_scraped_page is not None
+        and bool(homepage_scraped_page.content and homepage_scraped_page.content.strip())
+        and len(homepage_scraped_page.content.strip()) >= MIN_PAGE_CONTENT_CHARS
+    )
+
     try:
-        selection_result = await select_pages_with_llm(
-            candidates=cleaned_candidates,
-            website_url=clean_url,
-            product_or_service=product_or_service,
-        )
+        if is_homepage_reusable:
+            # Homepage counts as 1 of the 6 total pages.
+            # Select up to 5 related pages from discovered URLs, excluding the homepage.
+            max_related_pages = min(5, max(1, settings.MAX_PAGES_USER_SITE - 1))
+            homepage_norm_urls: set[str] = set()
+            if homepage_scraped_page and homepage_scraped_page.url:
+                homepage_norm_urls.add(_normalize_url_for_merge(homepage_scraped_page.url))
+            if clean_url:
+                homepage_norm_urls.add(_normalize_url_for_merge(clean_url))
+            if discovery_result is not None:
+                for u in [getattr(discovery_result, "requested_url", None), getattr(discovery_result, "base_url", None)]:
+                    if u:
+                        homepage_norm_urls.add(_normalize_url_for_merge(u))
+
+            related_candidates = [
+                c for c in cleaned_candidates
+                if _normalize_url_for_merge(c.url) not in homepage_norm_urls
+                and categorize_candidate(c, base_url=clean_url) != SelectionCategory.HOME
+            ]
+
+            selection_result = await select_pages_with_llm(
+                candidates=related_candidates,
+                website_url=clean_url,
+                product_or_service=product_or_service,
+                max_pages=max_related_pages,
+                exclude_homepage=True,
+            )
+
+            # Ensure no homepage URL is included and limit does not exceed 5
+            filtered_selected = [
+                p for p in selection_result.selected_pages
+                if _normalize_url_for_merge(p.url) not in homepage_norm_urls
+            ][:max_related_pages]
+            selection_result.selected_pages = filtered_selected
+            selection_result.total_selected = len(filtered_selected)
+        else:
+            # Homepage not available upfront; select up to total page limit (6 pages total)
+            selection_result = await select_pages_with_llm(
+                candidates=cleaned_candidates,
+                website_url=clean_url,
+                product_or_service=product_or_service,
+                max_pages=settings.MAX_PAGES_USER_SITE,
+            )
+            selection_result.selected_pages = selection_result.selected_pages[:settings.MAX_PAGES_USER_SITE]
+            selection_result.total_selected = len(selection_result.selected_pages)
     except Exception as exc:
         logger.exception("Unexpected exception in page selection service for '%s': %s", clean_url, exc)
         error_msg = f"Page selection service failed unexpectedly for '{clean_url}': {exc}"
@@ -161,6 +228,18 @@ async def page_selection_node(state: AgentState) -> dict[str, Any]:
 
     # 5. Handle selection failure (0 selected pages)
     if not selection_result.selected_pages or selection_result.total_selected == 0:
+        if is_homepage_reusable:
+            logger.info(
+                "Page selection yielded 0 related pages for '%s', but homepage is already available; proceeding with homepage only.",
+                clean_url,
+            )
+            return {
+                "selection_result": selection_result,
+                "selected_pages": [],
+                "current_step": "page_selection",
+                "workflow_status": "running",
+            }
+
         error_msg = (
             f"Page selection yielded 0 selected pages for '{clean_url}': "
             f"{selection_result.error_message or 'No relevant candidate URLs were selected.'}"

@@ -9,13 +9,13 @@ Key Responsibilities:
 - Ground all facts, products, services, features, and positioning in the provided website text.
 - Enforce strict accuracy: no hallucinated facts, prices, audience claims, or marketing advice.
 - Distinguish between explicit statements and inferred observations.
-- Preserve source URLs on every finding and item to ensure full traceability, including multi-page attribution.
+- Preserve source URLs on every item to ensure full traceability, including multi-page attribution.
 - Support accurate offering classification: individual products, variants, collections, services, packages, SaaS features, and subscription plans.
 - Support structured pricing: price, currency, original price, discounts, billing period, and availability status.
 - Identify and catalog information gaps and explicit discrepancies between user intake and website content.
 - Use the shared canonical model configuration (``settings.LLM_MODEL``).
 - Bound token usage by applying deterministic water-filling per-page and total input character limits.
-- Return a structured :class:`BusinessOverviewResult` leveraging existing schemas (:class:`Finding`).
+- Return a structured :class:`BusinessOverviewResult`.
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ from backend.app.agent.prompts.business_overview import (
     BUSINESS_OVERVIEW_USER_PROMPT_TEMPLATE,
 )
 from backend.app.core.config import settings
-from backend.app.schemas.enums import FindingType, OfferingType, PageType, PriceAvailability
-from backend.app.schemas.scraped_data import Finding, ScrapedPage
+from backend.app.schemas.enums import OfferingType, PageType, PriceAvailability
+from backend.app.schemas.scraped_data import ScrapedPage
 from .website_content_crawler_service import WebsiteCrawlResult
 
 logger = logging.getLogger(__name__)
@@ -90,23 +90,23 @@ class PricingInfo(BaseModel):
 
 
 class ProductServiceItem(BaseModel):
-    """Represents a discrete product, service, collection, feature, or plan offered by the business."""
+    """Represents a discrete product category, service line, collection, or core offering."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    name: str = Field(description="Name or title of the product, service, collection, or plan.")
+    name: str = Field(description="Name or title of the product category, service line, collection, or core offering.")
     offering_type: OfferingType = Field(
-        default=OfferingType.PRODUCT,
-        description="Classification: 'product', 'product_variant', 'collection', 'service', 'service_package', 'saas_feature', 'subscription_plan', 'bundle', or 'other'.",
+        default=OfferingType.COLLECTION,
+        description="Classification: 'collection', 'product', 'service', 'service_package', 'saas_feature', 'subscription_plan', 'bundle', or 'other'.",
     )
-    description: str = Field(description="Factual description based strictly on the website text.")
+    description: str = Field(description="Informative description explaining what the category contains or service provides, citing illustrative examples if relevant.")
     pricing: PricingInfo | None = Field(
         default=None,
-        description="Commercial pricing, discount, or subscription terms if available or stated on the website.",
+        description="High-level commercial pricing model or price tier if supported by website evidence.",
     )
     variants: list[str] = Field(
         default_factory=list,
-        description="Explicit product variants such as shades, sizes, colors, or editions if applicable.",
+        description="Key subcategories, product lines, or illustrative items within this offering category.",
     )
     features: list[str] = Field(
         default_factory=list,
@@ -214,10 +214,6 @@ class BusinessOverview(BaseModel):
     information_gaps: list[InformationGap] = Field(
         default_factory=list,
         description="Key business dimensions that could not be determined from the available crawled content.",
-    )
-    key_findings: list[Finding] = Field(
-        default_factory=list,
-        description="Significant additional business-level observations (business model, distribution approach, commercial patterns, customer policies) not covered in other sections.",
     )
     sources_used: list[str] = Field(
         default_factory=list,
@@ -469,7 +465,6 @@ def _sanitize_and_validate_overview(
       mark its source_url as None and clear invalid URLs from source_urls.
     - If a target audience or value proposition claim had is_explicit=True but its source
       cannot be verified, set is_explicit=False.
-    - For key_findings, since Finding requires a verified URL, remove unsupported findings.
     - sources_used is compiled strictly from verified, non-null source URLs.
     - Preserves user-provided business intake and reports explicit contradictions in conflicts.
     """
@@ -507,7 +502,18 @@ def _sanitize_and_validate_overview(
                 path_to_original["/" + path_parts[-1]] = orig_url
 
     # 1. Sanitize product/service items, pricing, and multi-source URLs
+    unique_products: list[ProductServiceItem] = []
+    seen_offering_names: set[str] = set()
+
     for p in overview.products_and_services:
+        name_clean = p.name.strip() if p.name else ""
+        name_norm = " ".join(name_clean.lower().split())
+        if name_norm and name_norm in seen_offering_names:
+            logger.info("Dropping duplicate offering category: '%s'", name_clean)
+            continue
+        if name_norm:
+            seen_offering_names.add(name_norm)
+
         verified_sources_list: list[str] = []
         # Check source_urls list first
         if hasattr(p, "source_urls") and p.source_urls:
@@ -530,6 +536,10 @@ def _sanitize_and_validate_overview(
         if p.pricing is not None:
             if not p.pricing.price and p.pricing.availability == PriceAvailability.AVAILABLE:
                 p.pricing.availability = PriceAvailability.NOT_STATED
+
+        unique_products.append(p)
+
+    overview.products_and_services = unique_products
 
     # 2. Sanitize value propositions
     for vp in overview.positioning_and_value_propositions:
@@ -559,63 +569,7 @@ def _sanitize_and_validate_overview(
     if verified_audience_source is None and overview.target_audience.is_explicit:
         overview.target_audience.is_explicit = False
 
-    # 4. Sanitize key findings (remove duplicates, findings duplicating other sections, and unverified URLs)
-    verified_findings: list[Finding] = []
-    dropped_findings_count = 0
-    seen_finding_statements: set[str] = set()
-
-    # Pre-collect normalized statements from other sections for cross-section deduplication
-    existing_statements: set[str] = set()
-    if overview.business_description:
-        existing_statements.add(" ".join(overview.business_description.strip().lower().split()))
-    for vp in overview.positioning_and_value_propositions:
-        if vp.statement:
-            existing_statements.add(" ".join(vp.statement.strip().lower().split()))
-
-    for finding in overview.key_findings:
-        statement_clean = finding.statement.strip()
-        statement_norm = " ".join(statement_clean.lower().split())
-
-        # Drop exact duplicate findings within key_findings
-        if statement_norm in seen_finding_statements:
-            dropped_findings_count += 1
-            logger.info("Dropping duplicate finding statement: '%s'", statement_clean[:60])
-            continue
-
-        # Drop finding if it directly duplicates a value proposition or the business description
-        if statement_norm in existing_statements:
-            dropped_findings_count += 1
-            logger.info("Dropping finding that duplicates existing section statement: '%s'", statement_clean[:60])
-            continue
-
-        verified_finding_sources: list[str] = []
-        if hasattr(finding, "source_urls") and finding.source_urls:
-            for s_url in finding.source_urls:
-                ver = _resolve_and_verify_source_url(s_url, norm_to_original, path_to_original, resolved_base)
-                if ver and ver not in verified_finding_sources:
-                    verified_finding_sources.append(ver)
-
-        verified_primary = _resolve_and_verify_source_url(
-            finding.source_url, norm_to_original, path_to_original, resolved_base
-        )
-        if verified_primary and verified_primary not in verified_finding_sources:
-            verified_finding_sources.insert(0, verified_primary)
-
-        if verified_finding_sources:
-            finding.source_urls = verified_finding_sources
-            finding.source_url = verified_finding_sources[0]
-            seen_finding_statements.add(statement_norm)
-            verified_findings.append(finding)
-        else:
-            dropped_findings_count += 1
-            logger.warning(
-                "Dropping unsupported finding '%s' citing un-crawled/unverified source: '%s'",
-                finding.statement[:60],
-                finding.source_url,
-            )
-    overview.key_findings = verified_findings
-
-    # 5. Compile sources_used strictly from verified sources
+    # 4. Compile sources_used strictly from verified sources
     verified_sources: set[str] = set()
     for p in overview.products_and_services:
         if p.source_url:
@@ -626,11 +580,6 @@ def _sanitize_and_validate_overview(
         if vp.source_url:
             verified_sources.add(vp.source_url)
         for u in vp.source_urls:
-            verified_sources.add(u)
-    for f in overview.key_findings:
-        if f.source_url:
-            verified_sources.add(f.source_url)
-        for u in f.source_urls:
             verified_sources.add(u)
     if overview.target_audience and overview.target_audience.source_url:
         verified_sources.add(overview.target_audience.source_url)
@@ -643,7 +592,7 @@ def _sanitize_and_validate_overview(
 
     overview.sources_used = sorted(list(verified_sources))
 
-    # 6. Harmonize with user-provided intake data and detect explicit conflicts
+    # 5. Harmonize with user-provided intake data and detect explicit conflicts
     if business_form is not None:
         stated_name_desc = ""
         stated_audience = ""
@@ -683,9 +632,7 @@ def _sanitize_and_validate_overview(
             overview.business_description = stated_name_desc
 
     logger.info(
-        "[business_overview_trace] [CHECKPOINT 5: sanitization] Sanitization complete: %d findings verified, %d dropped. %d verified sources in sources_used, %d conflicts detected.",
-        len(overview.key_findings),
-        dropped_findings_count,
+        "[business_overview_trace] [CHECKPOINT 5: sanitization] Sanitization complete: %d verified sources in sources_used, %d conflicts detected.",
         len(overview.sources_used),
         len(overview.conflicts),
     )
@@ -704,6 +651,7 @@ async def generate_business_overview(
     business_form: Any = None,
     model: str | None = None,
     timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+    on_progress: Any = None,
 ) -> BusinessOverviewResult:
     """Generate a structured, evidence-based business overview from crawled website content.
 
@@ -719,6 +667,15 @@ async def generate_business_overview(
         A populated :class:`BusinessOverviewResult` containing the overview and metadata.
     """
     start_time = time.monotonic()
+
+    async def _emit_progress(stage: str, message: str, meta: dict[str, Any] | None = None) -> None:
+        if on_progress:
+            try:
+                res = on_progress(stage, message, meta or {})
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as prog_exc:
+                logger.debug("Progress callback exception (ignored): %s", prog_exc)
 
     # 1. Extract and validate usable scraped pages
     usable_pages, inferred_url = _extract_usable_pages(crawl_input)
@@ -761,6 +718,12 @@ async def generate_business_overview(
             execution_time_seconds=round(time.monotonic() - start_time, 2),
             error_message=msg,
         )
+
+    await _emit_progress(
+        "extracting_info",
+        f"Extracting offerings and value proposition from {len(usable_pages)} page(s)...",
+        {"page_count": len(usable_pages), "total_chars": total_content_length},
+    )
 
     # 3. Resolve LLM model identifier (defaults to shared settings.LLM_MODEL)
     resolved_model = model or settings.LLM_MODEL
@@ -812,6 +775,12 @@ async def generate_business_overview(
         stated_audience = business_form.get("target_audience", "") or ""
         audience_unknown = bool(business_form.get("audience_unknown", False))
 
+    await _emit_progress(
+        "identifying_audience",
+        "Identifying target customers and audience profiles...",
+        {"has_stated_audience": bool(stated_audience)},
+    )
+
     intake_parts: list[str] = []
     if stated_name_desc:
         intake_parts.append(f"- Stated Business Identity: {stated_name_desc}")
@@ -841,6 +810,11 @@ async def generate_business_overview(
     )
 
     # 6. Invoke OpenAI Structured Output
+    await _emit_progress(
+        "writing_overview",
+        f"Synthesizing and writing final business overview with {resolved_model}...",
+        {"model": resolved_model, "page_count": len(included_pages)},
+    )
     try:
         client = AsyncOpenAI(api_key=raw_api_key, timeout=timeout_seconds)
 
@@ -869,9 +843,8 @@ async def generate_business_overview(
             )
 
         logger.info(
-            "[business_overview_trace] [CHECKPOINT 4: raw_llm_response] Received raw LLM response: %d products, %d findings, %d VPs.",
+            "[business_overview_trace] [CHECKPOINT 4: raw_llm_response] Received raw LLM response: %d products, %d VPs.",
             len(parsed_overview.products_and_services),
-            len(parsed_overview.key_findings),
             len(parsed_overview.positioning_and_value_propositions),
         )
 
@@ -884,13 +857,11 @@ async def generate_business_overview(
             business_form=business_form,
         )
 
-        total_findings = len(sanitized_overview.key_findings)
         exec_time = round(time.monotonic() - start_time, 2)
         logger.info(
-            "Successfully generated business overview for %s in %.2fs (%d findings, %d products).",
+            "Successfully generated business overview for %s in %.2fs (%d products).",
             resolved_website_url,
             exec_time,
-            total_findings,
             len(sanitized_overview.products_and_services),
         )
 
@@ -899,7 +870,7 @@ async def generate_business_overview(
             business_overview=sanitized_overview,
             website_url=resolved_website_url,
             total_pages_analyzed=len(included_pages),
-            total_findings=total_findings,
+            total_findings=0,
             model_used=resolved_model,
             execution_time_seconds=exec_time,
             error_message=None,

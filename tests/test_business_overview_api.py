@@ -177,8 +177,8 @@ class TestBusinessOverviewAPI(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             data = response.json()
 
-            # Verify the response contains ONLY the 4 required public fields
-            expected_keys = {"status", "business_overview", "website_url", "execution_time_seconds"}
+            # Verify the response contains expected fields
+            expected_keys = {"status", "business_overview", "website_url", "execution_time_seconds", "total_pages_analyzed"}
             self.assertEqual(set(data.keys()), expected_keys)
 
             # Verify top-level fields
@@ -194,11 +194,11 @@ class TestBusinessOverviewAPI(unittest.TestCase):
             self.assertIn("target_audience", overview_data)
             self.assertEqual(len(overview_data.get("positioning_and_value_propositions", [])), 2)
             self.assertEqual(len(overview_data.get("information_gaps", [])), 1)
-            self.assertEqual(len(overview_data.get("key_findings", [])), 2)
+            self.assertNotIn("key_findings", overview_data)
 
             # Explicitly verify removed fields are NOT present
+            self.assertEqual(data.get("total_pages_analyzed"), 3)
             self.assertNotIn("workflow_status", data)
-            self.assertNotIn("total_pages_analyzed", data)
             self.assertNotIn("total_findings", data)
             self.assertNotIn("model_used", data)
             self.assertNotIn("metadata", data)

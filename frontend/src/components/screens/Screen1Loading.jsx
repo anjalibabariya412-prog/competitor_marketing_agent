@@ -1,7 +1,19 @@
 import React from 'react';
 import { GlobeIcon, AlertCircleIcon, RefreshIcon } from '../common/Icons.jsx';
+import { StepProgressList } from './StepProgressList.jsx';
 
-export function Screen1Loading({ website, onCancel, error, onRetry }) {
+export function Screen1Loading({
+  website,
+  onCancel,
+  error,
+  onRetry,
+  currentStage = null,
+  liveMeta = {},
+  isDone = false,
+  fallbackMode = false,
+}) {
+  const showStepper = Boolean(currentStage && !fallbackMode);
+
   return (
     <div className="single-form-layout">
       <div className="form-card-wrapper">
@@ -26,9 +38,11 @@ export function Screen1Loading({ website, onCancel, error, onRetry }) {
           </div>
         ) : (
           <div className="loading-content-box" aria-live="polite">
-            <div className="loading-visual-container">
-              <div className="pulse-radar-loader" aria-hidden="true" />
-            </div>
+            {!showStepper && (
+              <div className="loading-visual-container">
+                <div className="pulse-radar-loader" aria-hidden="true" />
+              </div>
+            )}
 
             {website && (
               <div className="loading-site-pill">
@@ -38,10 +52,19 @@ export function Screen1Loading({ website, onCancel, error, onRetry }) {
             )}
 
             <h2 className="loading-box-title">Generating Business Overview</h2>
-            <p className="loading-box-desc">
-              Reviewing website pages and extracting offerings, value propositions, and customer profiles.
-              This typically takes around 25–35 seconds.
-            </p>
+
+            {showStepper ? (
+              <StepProgressList
+                currentStage={currentStage}
+                liveMeta={liveMeta}
+                isDone={isDone}
+              />
+            ) : (
+              <p className="loading-box-desc">
+                Reviewing website pages and extracting offerings, value propositions, and customer profiles.
+                This typically takes around 25–35 seconds.
+              </p>
+            )}
 
             <div className="loading-meta-dock">
               <button type="button" onClick={onCancel} className="btn-cancel-flat">
