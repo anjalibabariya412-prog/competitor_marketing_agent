@@ -78,7 +78,7 @@ class SitemapDiscoveryResult(BaseModel):
     """Structured result returned by standalone sitemap discovery."""
 
     base_url: str = Field(description="Base URL used for discovery and resolving relative links.")
-    status: Literal["success", "no_sitemap_found", "empty_sitemap", "failed", "skipped"] = Field(
+    status: Literal["success", "partial", "no_sitemap_found", "empty_sitemap", "rate_limited", "failed", "skipped"] = Field(
         description="Outcome status of the sitemap discovery operation."
     )
     message: str | None = Field(
@@ -312,14 +312,22 @@ def _extract_sitemap_elements(root: ET.Element) -> tuple[list[str], list[str]]:
 async def _discover_sitemaps_from_robots(
     client: httpx.AsyncClient,
     base_url: str,
-) -> list[str]:
-    """Fetch robots.txt and extract all declared Sitemap directives."""
+) -> tuple[list[str], bool]:
+    """Fetch robots.txt and extract all declared Sitemap directives.
+
+    Returns:
+        (discovered_sitemap_urls, is_rate_limited)
+    """
     parsed = urllib.parse.urlsplit(base_url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     discovered: list[str] = []
+    is_rate_limited = False
 
     try:
         resp = await client.get(robots_url)
+        if resp.status_code == 429:
+            logger.warning("Robots.txt probe '%s' returned HTTP 429 (rate limited).", robots_url)
+            return [], True
         if resp.status_code == 200 and resp.text:
             for line in resp.text.splitlines():
                 line = line.strip()
@@ -334,7 +342,7 @@ async def _discover_sitemaps_from_robots(
     except Exception as exc:
         logger.debug("Robots.txt check failed for %s: %s", robots_url, exc)
 
-    return discovered
+    return discovered, is_rate_limited
 
 
 def _get_common_sitemap_probe_urls(base_url: str) -> list[str]:
@@ -428,7 +436,22 @@ async def discover_sitemap_urls(
         headers=headers,
     ) as client:
         # 1. Discover sitemaps declared in robots.txt
-        robots_sitemaps = await _discover_sitemaps_from_robots(client, base_url)
+        robots_sitemaps, robots_rate_limited = await _discover_sitemaps_from_robots(client, base_url)
+        if robots_rate_limited:
+            logger.warning(
+                "Robots.txt probe for %s returned HTTP 429 (rate limited). Stopping sitemap discovery.",
+                base_url,
+            )
+            parsed_robots = urllib.parse.urlsplit(base_url)
+            robots_url = f"{parsed_robots.scheme}://{parsed_robots.netloc}/robots.txt"
+            return SitemapDiscoveryResult(
+                base_url=base_url,
+                status="rate_limited",
+                message="Sitemap discovery stopped: robots.txt returned HTTP 429 Too Many Requests.",
+                sitemaps_checked=[robots_url],
+                candidate_urls=[],
+                total_found=0,
+            )
         for sm in robots_sitemaps:
             sitemaps_to_explore.append((sm, 1))
 
@@ -444,6 +467,7 @@ async def discover_sitemap_urls(
         seen_candidate_urls: set[str] = set()
         sitemaps_blocked = 0
         sitemaps_not_found = 0
+        sitemap_rate_limited = False
 
         while (
             (sitemaps_to_explore or (not discovered_candidates and not probed_common))
@@ -472,7 +496,14 @@ async def discover_sitemap_urls(
 
             try:
                 resp = await client.get(target_sitemap_url)
-                if resp.status_code in (401, 403):
+                if resp.status_code == 429:
+                    logger.warning(
+                        "Sitemap probe '%s' returned HTTP 429 (rate limited). Stopping additional sitemap probing.",
+                        target_sitemap_url,
+                    )
+                    sitemap_rate_limited = True
+                    break
+                elif resp.status_code in (401, 403):
                     sitemaps_blocked += 1
                     logger.warning("Sitemap probe '%s' blocked by server (HTTP %d).", target_sitemap_url, resp.status_code)
                     continue
@@ -566,6 +597,31 @@ async def discover_sitemap_urls(
                 logger.debug("Unexpected error processing sitemap '%s': %s", target_sitemap_url, exc)
 
     count = len(discovered_candidates)
+    if sitemap_rate_limited:
+        if count > 0:
+            logger.info(
+                "Sitemap discovery partially succeeded (%d URLs from %d sitemap files) before HTTP 429 rate limit on %s.",
+                count,
+                total_files_fetched,
+                base_url,
+            )
+            return SitemapDiscoveryResult(
+                base_url=base_url,
+                status="partial",
+                message=f"Discovered {count} candidate URLs from {total_files_fetched} sitemap file(s) before HTTP 429 rate limit stopped probing.",
+                sitemaps_checked=sitemaps_checked,
+                candidate_urls=discovered_candidates,
+                total_found=count,
+            )
+        return SitemapDiscoveryResult(
+            base_url=base_url,
+            status="rate_limited",
+            message="Sitemap discovery stopped: target server returned HTTP 429 Too Many Requests.",
+            sitemaps_checked=sitemaps_checked,
+            candidate_urls=[],
+            total_found=0,
+        )
+
     if count > 0:
         logger.info(
             "Sitemap discovery found %d candidate URLs across %d sitemap files for %s.",

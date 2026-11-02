@@ -100,6 +100,12 @@ class Settings(BaseSettings):
         le=60.0,
         description="Timeout in seconds for direct HTTP fetch requests.",
     )
+    HTTP_MAX_CONCURRENCY: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum concurrent HTTP requests for internal page crawling.",
+    )
     MIN_PAGE_ADEQUACY_CHARS: int = Field(
         default=50,
         description="Minimum character threshold for general crawled page content to be considered adequate.",

@@ -266,6 +266,31 @@ class WebsiteCrawlResult(BaseModel):
         default=None,
         description="High-level error description if the actor run failed.",
     )
+    # Lightweight retrieval metrics
+    http_attempted: int = Field(
+        default=0,
+        description="Number of HTTP requests actually attempted over the wire.",
+    )
+    http_succeeded: int = Field(
+        default=0,
+        description="Number of pages successfully retrieved via direct HTTP.",
+    )
+    http_failed: int = Field(
+        default=0,
+        description="Number of attempted HTTP requests that failed or were inadequate.",
+    )
+    http_429_count: int = Field(
+        default=0,
+        description="Number of HTTP 429 rate-limited responses received.",
+    )
+    browser_fallback_requested: int = Field(
+        default=0,
+        description="Number of pages submitted to the Apify browser fallback crawler.",
+    )
+    browser_fallback_succeeded: int = Field(
+        default=0,
+        description="Number of pages successfully retrieved via browser fallback.",
+    )
 
 
 @dataclass
@@ -434,6 +459,19 @@ def _log_crawler_diagnostics(
                 timing_part,
                 d.char_count,
                 trunc_part,
+            )
+        elif d.status == "SKIPPED":
+            logger.info(
+                "  [%d/%d] SKIPPED | url='%s'%s | method=%s | status=%s | duration=%s | content=0 chars | reason=[%s] %s",
+                idx,
+                len(diagnostics),
+                d.requested_url,
+                redirect_part,
+                d.retrieval_method,
+                http_part,
+                timing_part,
+                d.error_category or "RATE_LIMITED",
+                d.error_reason or "Skipped",
             )
         else:
             logger.warning(
@@ -1349,11 +1387,15 @@ async def crawl_selected_pages(
     http_successes: list[ScrapedPage] = []
     http_diagnostics: list[_PageDiagnostic] = []
     fallback_targets: dict[str, tuple[str, PageType, str | None]] = {}
+    http_attempted_count: int = 0
+    http_429_count: int = 0
 
     if settings.HTTP_FIRST_RETRIEVAL:
+        max_concurrency = max(1, settings.HTTP_MAX_CONCURRENCY)
         logger.info(
-            "Attempting HTTP-first retrieval for %d selected pages...",
+            "Attempting HTTP-first retrieval for %d selected pages (max_concurrency=%d)...",
             len(valid_targets),
+            max_concurrency,
         )
         http_headers = {
             "User-Agent": (
@@ -1363,6 +1405,70 @@ async def crawl_selected_pages(
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
+        rate_limited_event = asyncio.Event()
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def _bounded_fetch(
+            client: httpx.AsyncClient,
+            orig_u: str,
+            pt: PageType,
+            prior_title: str | None,
+        ) -> tuple[bool, ScrapedPage | None, _PageDiagnostic, str]:
+            nonlocal http_attempted_count, http_429_count
+
+            # 1. Pre-semaphore check: Stop scheduling if crawl is already rate-limited
+            if rate_limited_event.is_set():
+                diag = _PageDiagnostic(
+                    requested_url=orig_u,
+                    final_url=orig_u,
+                    status="SKIPPED",
+                    http_status=None,
+                    duration_seconds=0.0,
+                    char_count=0,
+                    is_truncated=False,
+                    error_category="RATE_LIMITED",
+                    error_reason="Skipped HTTP attempt: crawl rate-limited by target website (HTTP 429)",
+                    retrieval_method="http",
+                )
+                return False, None, diag, "skipped_due_to_rate_limit"
+
+            # 2. Acquire concurrency semaphore
+            async with sem:
+                # 3. Post-semaphore check: A concurrent task may have received 429 while this task was waiting
+                if rate_limited_event.is_set():
+                    diag = _PageDiagnostic(
+                        requested_url=orig_u,
+                        final_url=orig_u,
+                        status="SKIPPED",
+                        http_status=None,
+                        duration_seconds=0.0,
+                        char_count=0,
+                        is_truncated=False,
+                        error_category="RATE_LIMITED",
+                        error_reason="Skipped HTTP attempt: crawl rate-limited by target website (HTTP 429)",
+                        retrieval_method="http",
+                    )
+                    return False, None, diag, "skipped_due_to_rate_limit"
+
+                # 4. Actual HTTP request attempt
+                http_attempted_count += 1
+                success, page, diag, fb_reason = await _fetch_single_page_http(
+                    client, orig_u, pt, prior_title
+                )
+
+                # 5. Detect HTTP 429 and activate crawl-scoped stop signal
+                if diag and diag.http_status == 429:
+                    http_429_count += 1
+                    if not rate_limited_event.is_set():
+                        rate_limited_event.set()
+                        logger.warning(
+                            "[HTTP_FIRST] Website crawl rate-limited (HTTP 429) on '%s'. "
+                            "Stopping additional internal HTTP requests for this website crawl.",
+                            orig_u,
+                        )
+
+                return success, page, diag, fb_reason
+
         async with httpx.AsyncClient(
             timeout=settings.HTTP_RETRIEVAL_TIMEOUT_SECONDS,
             follow_redirects=True,
@@ -1370,7 +1476,7 @@ async def crawl_selected_pages(
             verify=True,
         ) as client:
             tasks = [
-                _fetch_single_page_http(client, orig_u, pt, prior_title)
+                _bounded_fetch(client, orig_u, pt, prior_title)
                 for orig_u, pt, prior_title in valid_targets.values()
             ]
             results = await asyncio.gather(*tasks)
@@ -1387,6 +1493,7 @@ async def crawl_selected_pages(
                 )
             else:
                 fallback_targets[norm_u] = target_info
+                http_diagnostics.append(diag)
                 logger.info(
                     "[HTTP_FIRST] Page '%s' requires browser fallback (reason: %s).",
                     target_info[0],
@@ -1448,6 +1555,12 @@ async def crawl_selected_pages(
             actor_run_id=None,
             actor_status=None,
             execution_time_seconds=exec_time,
+            http_attempted=http_attempted_count,
+            http_succeeded=len(http_successes),
+            http_failed=max(0, http_attempted_count - len(http_successes)),
+            http_429_count=http_429_count,
+            browser_fallback_requested=0,
+            browser_fallback_succeeded=0,
         )
 
     # 4. Validate Apify API token from settings for fallback targets
@@ -1496,6 +1609,12 @@ async def crawl_selected_pages(
             has_usable_content=bool(http_successes),
             execution_time_seconds=exec_time,
             error_message="APIFY_API_TOKEN is not configured in settings.",
+            http_attempted=http_attempted_count,
+            http_succeeded=len(http_successes),
+            http_failed=max(0, http_attempted_count - len(http_successes)),
+            http_429_count=http_429_count,
+            browser_fallback_requested=len(fallback_targets),
+            browser_fallback_succeeded=0,
         )
 
     raw_token: str = settings.APIFY_API_TOKEN.get_secret_value().strip()
@@ -1544,6 +1663,12 @@ async def crawl_selected_pages(
             has_usable_content=bool(http_successes),
             execution_time_seconds=exec_time,
             error_message="APIFY_API_TOKEN is set to a placeholder value.",
+            http_attempted=http_attempted_count,
+            http_succeeded=len(http_successes),
+            http_failed=max(0, http_attempted_count - len(http_successes)),
+            http_429_count=http_429_count,
+            browser_fallback_requested=len(fallback_targets),
+            browser_fallback_succeeded=0,
         )
 
     # 5. Prepare Actor input configuration for fallback targets only
@@ -1965,7 +2090,9 @@ async def crawl_selected_pages(
     )
 
     logger.info(
-        "Website content crawler finished for %s: status=%s (actor_status=%s), scraped=%d/%d (http=%d, browser=%d), failed=%d (time=%.2fs).",
+        "Website content crawler finished for %s: status=%s (actor_status=%s), "
+        "scraped=%d/%d (http=%d, browser=%d), failed=%d (time=%.2fs) | "
+        "metrics: http_attempted=%d, http_succeeded=%d, http_failed=%d, http_429=%d, fallback_requested=%d, fallback_succeeded=%d.",
         resolved_website_url,
         overall_status,
         actor_final_status,
@@ -1975,6 +2102,12 @@ async def crawl_selected_pages(
         len(browser_scraped_pages),
         total_failed,
         exec_time,
+        http_attempted_count,
+        len(http_successes),
+        max(0, http_attempted_count - len(http_successes)),
+        http_429_count,
+        len(fallback_targets),
+        len(browser_scraped_pages),
     )
 
     return WebsiteCrawlResult(
@@ -1990,6 +2123,12 @@ async def crawl_selected_pages(
         actor_status=actor_final_status,
         execution_time_seconds=exec_time,
         error_message=last_error,
+        http_attempted=http_attempted_count,
+        http_succeeded=len(http_successes),
+        http_failed=max(0, http_attempted_count - len(http_successes)),
+        http_429_count=http_429_count,
+        browser_fallback_requested=len(fallback_targets),
+        browser_fallback_succeeded=len(browser_scraped_pages),
     )
 
 
