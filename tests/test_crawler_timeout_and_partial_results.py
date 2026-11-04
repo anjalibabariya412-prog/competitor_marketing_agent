@@ -17,6 +17,7 @@ Covers all 12 scenarios required:
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -441,11 +442,16 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
 
             res = self.api_client.post("/api/v1/business-overview", json=payload)
             self.assertEqual(res.status_code, 200)
-            data = res.json()
+            self.assertIn("text/event-stream", res.headers.get("content-type", ""))
+            lines = [line.strip() for line in res.text.split("\n") if line.startswith("data: ")]
+            events = [json.loads(line[6:]) for line in lines]
+            done_event = next((e for e in events if e.get("stage") == "done"), None)
+            self.assertIsNotNone(done_event)
+            data = done_event["data"]
             self.assertEqual(data["status"], "success")
             self.assertEqual(data["business_overview"]["business_name"], "Swiss Beauty")
 
-        # Sub-case B: Partial crawl with insufficient content yields 422
+        # Sub-case B: Partial crawl with insufficient content yields error event in SSE stream
         insufficient_overview = BusinessOverviewResult(
             status="insufficient_content",
             business_overview=None,
@@ -459,9 +465,14 @@ class TestCrawlerTimeoutAndPartialResults(unittest.IsolatedAsyncioTestCase):
              patch("backend.app.agent.nodes.website_crawling_node.crawl_selected_pages", new=AsyncMock(return_value=partial_crawl_ok)), \
              patch("backend.app.agent.nodes.business_overview_node.generate_business_overview", new=AsyncMock(return_value=insufficient_overview)):
 
-            res_422 = self.api_client.post("/api/v1/business-overview", json=payload)
-            self.assertEqual(res_422.status_code, 422)
-            self.assertIn("Insufficient readable website content", res_422.json().get("detail", ""))
+            res_err = self.api_client.post("/api/v1/business-overview", json=payload)
+            self.assertEqual(res_err.status_code, 200)
+            self.assertIn("text/event-stream", res_err.headers.get("content-type", ""))
+            lines = [line.strip() for line in res_err.text.split("\n") if line.startswith("data: ")]
+            events = [json.loads(line[6:]) for line in lines]
+            err_event = next((e for e in events if e.get("stage") == "error"), None)
+            self.assertIsNotNone(err_event)
+            self.assertIn("Insufficient readable website content", err_event.get("message", ""))
 
 
 if __name__ == "__main__":

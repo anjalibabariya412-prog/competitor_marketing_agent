@@ -7,7 +7,7 @@ import { TopBar } from './components/common/TopBar.jsx';
 import { Screen1BusinessForm } from './components/screens/Screen1BusinessForm.jsx';
 import { Screen1Loading } from './components/screens/Screen1Loading.jsx';
 import { Screen2Overview } from './components/screens/Screen2Overview.jsx';
-import { fetchBusinessOverview, fetchBusinessOverviewStream } from './api/client.js';
+import { fetchBusinessOverviewStream } from './api/client.js';
 import './App.css';
 
 export default function App() {
@@ -17,7 +17,6 @@ export default function App() {
   const [currentStage, setCurrentStage] = useState(null);
   const [liveMeta, setLiveMeta] = useState(null);
   const [isDone, setIsDone] = useState(false);
-  const [fallbackMode, setFallbackMode] = useState(false);
 
   const abortRef = useRef(null);
 
@@ -33,7 +32,7 @@ export default function App() {
     }
   };
 
-  // Step 1 Submission: Stream progress or fall back to standard POST
+  // Step 1 Submission: Stream progress and deliver Business Overview
   const handleBusinessFormSubmit = async (formData) => {
     setSession((prev) => ({ ...prev, formData }));
     setApiError(null);
@@ -41,18 +40,14 @@ export default function App() {
     setCurrentStage('visiting_website');
     setLiveMeta({ website_url: formData.business_website });
     setIsDone(false);
-    setFallbackMode(false);
 
     const controller = new AbortController();
     abortRef.current = controller;
-
-    let receivedAnyEvent = false;
 
     try {
       const response = await fetchBusinessOverviewStream(
         formData,
         (evt) => {
-          receivedAnyEvent = true;
           if (evt.stage === 'done') {
             setIsDone(true);
           } else if (evt.stage) {
@@ -76,26 +71,6 @@ export default function App() {
         return;
       }
 
-      // If stream failed upfront before any events arrived, gracefully attempt non-streaming fallback
-      if (!receivedAnyEvent && !controller.signal.aborted) {
-        try {
-          setFallbackMode(true);
-          setCurrentStage(null);
-          const fallbackResponse = await fetchBusinessOverview(formData, controller.signal);
-          setSession((prev) => ({
-            ...prev,
-            overviewResponse: fallbackResponse,
-            currentStep: 2,
-          }));
-          return;
-        } catch (fallbackErr) {
-          if (fallbackErr.message !== 'Analysis was cancelled.') {
-            setApiError(fallbackErr.message || 'Unable to generate business overview. Please try again.');
-          }
-          return;
-        }
-      }
-
       setApiError(err.message || 'Unable to generate business overview. Please try again.');
     } finally {
       setIsLoading(false);
@@ -112,7 +87,6 @@ export default function App() {
     setCurrentStage(null);
     setLiveMeta(null);
     setIsDone(false);
-    setFallbackMode(false);
   };
 
   // Navigation handlers
@@ -140,7 +114,6 @@ export default function App() {
             currentStage={currentStage}
             liveMeta={liveMeta}
             isDone={isDone}
-            fallbackMode={fallbackMode}
           />
         ) : session.currentStep === 1 ? (
           <Screen1BusinessForm

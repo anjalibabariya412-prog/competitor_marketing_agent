@@ -1,4 +1,4 @@
-"""Unit tests for the streaming Business Overview SSE endpoint (POST /api/v1/business-overview/stream)."""
+"""Unit tests for the unified streaming Business Overview SSE endpoint (POST /api/v1/business-overview)."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ class TestBusinessOverviewStreamAPI(unittest.TestCase):
         mock_graph.ainvoke = AsyncMock(side_effect=mock_graph_invoke)
         app.dependency_overrides[get_graph] = lambda: mock_graph
 
-        response = self.client.post("/api/v1/business-overview/stream", json=_sample_payload())
+        response = self.client.post("/api/v1/business-overview", json=_sample_payload())
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/event-stream", response.headers.get("content-type", ""))
 
@@ -164,7 +164,7 @@ class TestBusinessOverviewStreamAPI(unittest.TestCase):
         mock_graph.ainvoke = AsyncMock(side_effect=mock_failed_crawl)
         app.dependency_overrides[get_graph] = lambda: mock_graph
 
-        response = self.client.post("/api/v1/business-overview/stream", json=_sample_payload())
+        response = self.client.post("/api/v1/business-overview", json=_sample_payload())
         self.assertEqual(response.status_code, 200)
 
         lines = [line.strip() for line in response.text.split("\n") if line.startswith("data: ")]
@@ -174,6 +174,11 @@ class TestBusinessOverviewStreamAPI(unittest.TestCase):
         self.assertIn("scrape_failed", stages)
         failed_event = next(e for e in events if e.get("stage") == "scrape_failed")
         self.assertIn("blocked", failed_event["message"].lower())
+
+    def test_old_stream_endpoint_is_removed(self) -> None:
+        """Verify POST /api/v1/business-overview/stream is removed and returns 404."""
+        response = self.client.post("/api/v1/business-overview/stream", json=_sample_payload())
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

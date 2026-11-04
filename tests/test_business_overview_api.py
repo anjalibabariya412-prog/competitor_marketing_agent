@@ -7,6 +7,7 @@ making real external API calls (OpenAI, Apify, etc.).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -93,13 +94,16 @@ class TestBusinessOverviewAPI(unittest.TestCase):
         self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
 
     def test_openapi_schema_contains_business_overview_endpoint(self) -> None:
-        """Verify that /api/v1/business-overview is registered in FastAPI OpenAPI docs."""
+        """Verify that /api/v1/business-overview is registered in FastAPI OpenAPI docs as SSE."""
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 200)
         schema = response.json()
         paths = schema.get("paths", {})
         self.assertIn("/api/v1/business-overview", paths)
         self.assertIn("post", paths["/api/v1/business-overview"])
+        self.assertNotIn("/api/v1/business-overview/stream", paths)
+        post_op = paths["/api/v1/business-overview"]["post"]
+        self.assertIn("text/event-stream", post_op.get("responses", {}).get("200", {}).get("content", {}))
 
     def test_request_validation_rejects_empty_payload(self) -> None:
         """Verify 422 Unprocessable Entity when request body is empty."""
@@ -175,7 +179,13 @@ class TestBusinessOverviewAPI(unittest.TestCase):
             response = self.client.post("/api/v1/business-overview", json=payload)
 
             self.assertEqual(response.status_code, 200)
-            data = response.json()
+            self.assertIn("text/event-stream", response.headers.get("content-type", ""))
+
+            lines = [line.strip() for line in response.text.split("\n") if line.startswith("data: ")]
+            events = [json.loads(line[6:]) for line in lines]
+            done_event = next((e for e in events if e.get("stage") == "done"), None)
+            self.assertIsNotNone(done_event)
+            data = done_event["data"]
 
             # Verify the response contains expected fields
             expected_keys = {"status", "business_overview", "website_url", "execution_time_seconds", "total_pages_analyzed"}
@@ -203,8 +213,8 @@ class TestBusinessOverviewAPI(unittest.TestCase):
             self.assertNotIn("model_used", data)
             self.assertNotIn("metadata", data)
 
-    def test_insufficient_content_returns_422(self) -> None:
-        """Verify 422 Unprocessable Entity when crawled content is insufficient for analysis."""
+    def test_insufficient_content_returns_error_event(self) -> None:
+        """Verify SSE stream emits error event when crawled content is insufficient for analysis."""
         payload = _sample_form_payload()
         discovery_result, _ = _create_sample_discovery_result()
         selection_result, _ = _create_sample_selection_result()
@@ -245,11 +255,16 @@ class TestBusinessOverviewAPI(unittest.TestCase):
         ):
             response = self.client.post("/api/v1/business-overview", json=payload)
 
-            self.assertEqual(response.status_code, 422)
-            self.assertIn("Insufficient readable website content", response.json().get("detail", ""))
+            self.assertEqual(response.status_code, 200)
+            lines = [line.strip() for line in response.text.split("\n") if line.startswith("data: ")]
+            events = [json.loads(line[6:]) for line in lines]
+            err_event = next((e for e in events if e.get("stage") == "error"), None)
+            self.assertIsNotNone(err_event)
+            self.assertEqual(err_event["meta"]["error_type"], "insufficient_content")
+            self.assertIn("Insufficient readable website content", err_event.get("message", ""))
 
-    def test_upstream_crawling_failure_returns_502(self) -> None:
-        """Verify 502 Bad Gateway when website crawling fails due to upstream server WAF blocking."""
+    def test_upstream_crawling_failure_returns_scrape_failed(self) -> None:
+        """Verify SSE stream emits scrape_failed when website crawling fails due to upstream server WAF blocking."""
         payload = _sample_form_payload()
         discovery_result, _ = _create_sample_discovery_result()
         selection_result, selected_pages = _create_sample_selection_result()
@@ -285,26 +300,32 @@ class TestBusinessOverviewAPI(unittest.TestCase):
         ):
             response = self.client.post("/api/v1/business-overview", json=payload)
 
-            self.assertEqual(response.status_code, 502)
-            self.assertIn("blocked by target server", response.json().get("detail", "").lower())
+            self.assertEqual(response.status_code, 200)
+            lines = [line.strip() for line in response.text.split("\n") if line.startswith("data: ")]
+            events = [json.loads(line[6:]) for line in lines]
+            failed_event = next((e for e in events if e.get("stage") == "scrape_failed"), None)
+            self.assertIsNotNone(failed_event)
+            self.assertIn("blocked by target server", failed_event.get("message", "").lower())
 
-    def test_unexpected_workflow_exception_returns_500(self) -> None:
-        """Verify 500 Internal Server Error when an unexpected exception occurs during execution."""
+    def test_unexpected_workflow_exception_returns_error_event(self) -> None:
+        """Verify SSE stream emits error event when an unexpected exception occurs during execution."""
         payload = _sample_form_payload()
 
         mock_graph = AsyncMock()
         mock_graph.ainvoke.side_effect = RuntimeError("Critical internal queue timeout")
 
         with patch("backend.app.api.routes.business_overview.get_graph", return_value=mock_graph):
-            # Also override dependency directly on FastAPI app
             app.dependency_overrides[get_graph] = lambda: mock_graph
             try:
                 response = self.client.post("/api/v1/business-overview", json=payload)
 
-                # Verify 500 status and that raw exception/stack trace is not leaked
-                self.assertEqual(response.status_code, 500)
-                self.assertNotIn("Critical internal queue timeout", response.json().get("detail", ""))
-                self.assertIn("unexpected error occurred", response.json().get("detail", "").lower())
+                self.assertEqual(response.status_code, 200)
+                lines = [line.strip() for line in response.text.split("\n") if line.startswith("data: ")]
+                events = [json.loads(line[6:]) for line in lines]
+                err_event = next((e for e in events if e.get("stage") == "error"), None)
+                self.assertIsNotNone(err_event)
+                self.assertNotIn("Critical internal queue timeout", err_event.get("message", ""))
+                self.assertIn("unexpected error occurred", err_event.get("message", "").lower())
             finally:
                 app.dependency_overrides.pop(get_graph, None)
 

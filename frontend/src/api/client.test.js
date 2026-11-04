@@ -88,3 +88,37 @@ test('fetchBusinessOverviewStream throws on scrape_failed event', async () => {
   }
 });
 
+test('fetchBusinessOverviewStream calls /api/v1/business-overview with text/event-stream accept header', async () => {
+  const originalFetch = global.fetch;
+  let requestedUrl = null;
+  let requestedHeaders = null;
+
+  global.fetch = async (url, options) => {
+    requestedUrl = url;
+    requestedHeaders = options.headers;
+    const mockChunks = [
+      'data: {"stage": "done", "payload": {"status": "success", "business_overview": {}}}\n\n',
+    ];
+    return {
+      ok: true,
+      body: createMockStream(mockChunks),
+    };
+  };
+
+  try {
+    const payload = {
+      business_name_and_description: 'Test Co',
+      product_or_service: 'SaaS',
+      business_website: 'https://example.com',
+      audience_unknown: true,
+    };
+    await fetchBusinessOverviewStream(payload, () => {});
+    assert.match(requestedUrl, /\/api\/v1\/business-overview$/);
+    assert.doesNotMatch(requestedUrl, /\/stream$/);
+    assert.equal(requestedHeaders['Accept'], 'text/event-stream');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+
