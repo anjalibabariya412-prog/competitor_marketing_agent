@@ -45,7 +45,7 @@ class TestPhase4And5GeoAndRobustness(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(overview.products_and_services), 1)
         self.assertIsNone(overview.products_and_services[0].source_url)
         self.assertFalse(overview.target_audience.is_explicit)
-        self.assertIn("Emergency synthesis", overview.conflicts[0])
+        self.assertIn("Target site blocked scraper", overview.information_gaps[0].observation)
         self.assertEqual(len(overview.sources_used), 0)
 
     async def test_emergency_overview_gated_by_setting(self) -> None:
@@ -81,7 +81,6 @@ class TestPhase4And5GeoAndRobustness(unittest.IsolatedAsyncioTestCase):
                 "source_url": "https://example.com/about",
             },
             "positioning_and_value_propositions": [],
-            "conflicts": [],
             "information_gaps": [],
             "sources_used": ["https://example.com/about"],
         }

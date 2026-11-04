@@ -4,6 +4,7 @@ from .business_form import BusinessForm
 from .business_overview_response import (
     BusinessOverviewMetadata,
     BusinessOverviewResponse,
+    MessagingInfo,
 )
 from .enums import FindingType, OfferingType, PageType, Platform, PriceAvailability, SocialSource
 from .scraped_data import Finding, ScrapedPage, SocialLink
@@ -14,6 +15,7 @@ __all__ = [
     "BusinessOverviewResponse",
     "Finding",
     "FindingType",
+    "MessagingInfo",
     "OfferingType",
     "PageType",
     "PriceAvailability",

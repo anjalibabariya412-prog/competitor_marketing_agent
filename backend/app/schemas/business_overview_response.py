@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.app.services.business_overview_service import BusinessOverview
+from backend.app.services.business_overview_service import BusinessOverview, MessagingInfo
 
 
 class BusinessOverviewMetadata(BaseModel):

@@ -15,7 +15,7 @@ Verifies all 18 scenarios required for Issue 4:
 12. Hallucinated source URLs rejected across products, value propositions, and findings.
 13. Valid source URLs with harmless formatting differences resolved.
 14. Findings supported by multiple pages (source_urls list populated and verified).
-15. Conflicting user-provided and website-derived information (has_conflict=True, documented in conflicts).
+15. Conflicting user-provided and website-derived information (has_conflict=True).
 16. Missing optional fields handled without error.
 17. Existing valid findings surviving sanitization.
 18. Final API response conforming to the updated schema.
@@ -33,6 +33,7 @@ from backend.app.schemas.scraped_data import Finding, ScrapedPage
 from backend.app.services.business_overview_service import (
     BusinessOverview,
     InformationGap,
+    MessagingInfo,
     PricingInfo,
     ProductServiceItem,
     TargetAudienceInfo,
@@ -546,7 +547,7 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
 
     # --- Scenario 15: Conflicting user-provided and website-derived information ---
     def test_15_conflicting_user_and_website_information(self) -> None:
-        """Verify audience conflicts are detected, flagged in has_conflict, and recorded in conflicts list."""
+        """Verify audience conflicts are detected and flagged in has_conflict."""
         b2b_form = BusinessForm(
             business_name_and_description="Aura Skincare B2B wholesale.",
             product_or_service="Wholesale bulk cosmetic ingredients",
@@ -575,8 +576,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
             sanitized.target_audience.user_stated_audience,
             "B2B cosmetic manufacturers and wholesale retailers",
         )
-        self.assertGreater(len(sanitized.conflicts), 0)
-        self.assertTrue(any("Audience discrepancy" in c for c in sanitized.conflicts))
 
     # --- Scenario 16: Missing optional fields handled without error ---
     def test_16_missing_optional_fields_handled_cleanly(self) -> None:
@@ -603,7 +602,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
         self.assertIsNone(sanitized.products_and_services[0].pricing)
         self.assertEqual(sanitized.products_and_services[0].variants, [])
         self.assertEqual(sanitized.products_and_services[0].source_urls, [])
-        self.assertEqual(sanitized.conflicts, [])
         self.assertEqual(sanitized.information_gaps, [])
 
     # --- Scenario 17: Existing valid findings surviving sanitization ---
@@ -693,7 +691,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                     observation="No explicit organic certification logos verified on crawled pages.",
                 )
             ],
-            conflicts=[],
         )
 
         response = BusinessOverviewResponse(
@@ -721,8 +718,11 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
 
         self.assertTrue(bo["target_audience"]["is_explicit"])
         self.assertFalse(bo["target_audience"]["has_conflict"])
-        self.assertIn("conflicts", bo)
-        self.assertEqual(bo["conflicts"], [])
+        self.assertNotIn("conflicts", bo)
+        self.assertIn("messaging", bo)
+        self.assertEqual(bo["messaging"]["core_messages"], [])
+        self.assertIsNone(bo["messaging"]["brand_tone"])
+        self.assertEqual(bo["messaging"]["recurring_themes"], [])
 
         # Verify JSON serialization works seamlessly
         json_output = response.model_dump_json()
@@ -781,7 +781,6 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
                 )
             ],
             sources_used=[],
-            conflicts=[],
         )
 
         sanitized = _sanitize_and_validate_overview(overview, self.crawled_pages, self.sample_form)
@@ -807,6 +806,91 @@ class TestBusinessOverviewSchemaAndQuality(unittest.TestCase):
 
         # Uncertainty preserved (not turned into site-wide claim)
         self.assertIn("not listed on the reviewed product pages", sanitized.information_gaps[0].observation)
+
+    # --- Scenario 24: MessagingInfo schema and field defaults ---
+    def test_24_messaging_info_schema_and_defaults(self) -> None:
+        """Verify MessagingInfo default values, coercion, and custom values."""
+        m_default = MessagingInfo()
+        self.assertEqual(m_default.core_messages, [])
+        self.assertIsNone(m_default.brand_tone)
+        self.assertEqual(m_default.recurring_themes, [])
+
+        m_custom = MessagingInfo(
+            core_messages=["Pure botanical skincare that delivers visible results."],
+            brand_tone="conversational",
+            recurring_themes=["clean beauty", "sustainability"],
+        )
+        self.assertEqual(m_custom.core_messages, ["Pure botanical skincare that delivers visible results."])
+        self.assertEqual(m_custom.brand_tone, "conversational")
+        self.assertEqual(m_custom.recurring_themes, ["clean beauty", "sustainability"])
+
+    # --- Scenario 25: Missing messaging handled gracefully ---
+    def test_25_missing_messaging_handled_gracefully(self) -> None:
+        """Verify BusinessOverview parses and handles missing/null messaging gracefully."""
+        # 1. Missing messaging entirely from instantiation
+        bo1 = BusinessOverview(
+            website_url="https://aura-skincare.example.com",
+            business_description="Botanical skincare.",
+            target_audience=TargetAudienceInfo(description="Direct consumers", is_explicit=True),
+        )
+        self.assertIsNotNone(bo1.messaging)
+        self.assertEqual(bo1.messaging.core_messages, [])
+        self.assertIsNone(bo1.messaging.brand_tone)
+        self.assertEqual(bo1.messaging.recurring_themes, [])
+
+        # 2. None passed into model_validate
+        bo2 = BusinessOverview.model_validate({
+            "website_url": "https://aura-skincare.example.com",
+            "business_description": "Botanical skincare.",
+            "target_audience": {"description": "Direct consumers", "is_explicit": True},
+            "messaging": None,
+        })
+        self.assertIsNotNone(bo2.messaging)
+        self.assertEqual(bo2.messaging.core_messages, [])
+
+        # 3. None inside MessagingInfo lists
+        bo3 = BusinessOverview.model_validate({
+            "website_url": "https://aura-skincare.example.com",
+            "business_description": "Botanical skincare.",
+            "target_audience": {"description": "Direct consumers", "is_explicit": True},
+            "messaging": {"core_messages": None, "brand_tone": None, "recurring_themes": None},
+        })
+        self.assertEqual(bo3.messaging.core_messages, [])
+        self.assertIsNone(bo3.messaging.brand_tone)
+        self.assertEqual(bo3.messaging.recurring_themes, [])
+
+    # --- Scenario 26: Messaging sanitization preserves evidence and cleans noise ---
+    def test_26_messaging_sanitization_in_business_overview(self) -> None:
+        """Verify _sanitize_and_validate_overview sanitizes messaging fields cleanly."""
+        overview = BusinessOverview(
+            website_url="https://aura-skincare.example.com",
+            business_description="Botanical skincare.",
+            target_audience=TargetAudienceInfo(description="Direct consumers", is_explicit=True),
+            messaging=MessagingInfo(
+                core_messages=["  Gentle on skin, tough on pollutants.  ", ""],
+                brand_tone="  premium  ",
+                recurring_themes=["  eco-friendly packaging  ", "   "],
+            ),
+        )
+        sanitized = _sanitize_and_validate_overview(overview, self.crawled_pages, self.sample_form)
+        self.assertEqual(sanitized.messaging.core_messages, ["Gentle on skin, tough on pollutants."])
+        self.assertEqual(sanitized.messaging.brand_tone, "premium")
+        self.assertEqual(sanitized.messaging.recurring_themes, ["eco-friendly packaging"])
+
+    # --- Scenario 27: Prompt contains messaging extraction instructions ---
+    def test_27_prompt_contains_messaging_extraction_rules(self) -> None:
+        """Verify prompt templates instruct the LLM on messaging, tone, and recurring themes."""
+        from backend.app.agent.prompts.business_overview import (
+            BUSINESS_OVERVIEW_SYSTEM_PROMPT,
+            BUSINESS_OVERVIEW_USER_PROMPT_TEMPLATE,
+        )
+
+        self.assertIn("BRAND MESSAGING (CORE MESSAGES, TONE & THEMES)", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("core_messages", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("brand_tone", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("recurring_themes", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("Do not invent brand messages, tone, or themes", BUSINESS_OVERVIEW_SYSTEM_PROMPT)
+        self.assertIn("In `messaging`, extract the brand's core messages", BUSINESS_OVERVIEW_USER_PROMPT_TEMPLATE)
 
 
 

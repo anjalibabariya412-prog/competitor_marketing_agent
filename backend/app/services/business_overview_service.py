@@ -26,10 +26,12 @@ import logging
 import re
 import time
 import urllib.parse
+import uuid
 from typing import Any, Literal, Sequence
 
 from openai import AsyncOpenAI, OpenAIError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.orm import Session
 
 from backend.app.agent.prompts.business_overview import (
     BUSINESS_OVERVIEW_SYSTEM_PROMPT,
@@ -188,6 +190,44 @@ class InformationGap(BaseModel):
     )
 
 
+class MessagingInfo(BaseModel):
+    """Brand messaging information including core messages, tone, and recurring themes."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    core_messages: list[str] = Field(
+        default_factory=list,
+        description="The main messages the business communicates to its customers.",
+    )
+    brand_tone: str | None = Field(
+        default=None,
+        description="The communication tone used by the brand, such as professional, friendly, conversational, premium, or informative.",
+    )
+    recurring_themes: list[str] = Field(
+        default_factory=list,
+        description="Topics, claims, or themes repeatedly emphasized across the website.",
+    )
+
+    @field_validator("core_messages", "recurring_themes", mode="before")
+    @classmethod
+    def _coerce_lists(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if x is not None and str(x).strip()]
+        return []
+
+    @field_validator("brand_tone", mode="before")
+    @classmethod
+    def _coerce_brand_tone(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            cleaned = v.strip()
+            return cleaned or None
+        return str(v).strip() or None
+
+
 class BusinessOverview(BaseModel):
     """Complete evidence-based business overview generated from crawled website content."""
 
@@ -212,9 +252,9 @@ class BusinessOverview(BaseModel):
         default_factory=list,
         description="Key positioning claims, value propositions, or differentiators.",
     )
-    conflicts: list[str] = Field(
-        default_factory=list,
-        description="Explicit discrepancies identified between user intake and website evidence.",
+    messaging: MessagingInfo = Field(
+        default_factory=MessagingInfo,
+        description="Brand messaging information including core messages, tone, and recurring themes.",
     )
     information_gaps: list[InformationGap] = Field(
         default_factory=list,
@@ -224,6 +264,13 @@ class BusinessOverview(BaseModel):
         default_factory=list,
         description="List of all distinct page URLs that contributed evidence to this overview.",
     )
+
+    @field_validator("messaging", mode="before")
+    @classmethod
+    def _coerce_messaging(cls, v: Any) -> Any:
+        if v is None:
+            return MessagingInfo()
+        return v
 
 
 class BusinessOverviewResult(BaseModel):
@@ -561,7 +608,7 @@ def synthesize_emergency_overview(
         products_and_services=products,
         target_audience=target_aud,
         positioning_and_value_propositions=value_props,
-        conflicts=[f"Emergency synthesis: {reason}"],
+        messaging=MessagingInfo(core_messages=[], brand_tone=None, recurring_themes=[]),
         information_gaps=gaps,
         sources_used=[],
     )
@@ -697,7 +744,7 @@ def _sanitize_and_validate_overview(
     - If a target audience or value proposition claim had is_explicit=True but its source
       cannot be verified, set is_explicit=False.
     - sources_used is compiled strictly from verified, non-null source URLs.
-    - Preserves user-provided business intake and reports explicit contradictions in conflicts.
+    - Preserves user-provided business intake.
     """
     # Support callers passing business_form as base_website_url positionally
     if hasattr(base_website_url, "business_website") or hasattr(base_website_url, "business_name_and_description"):
@@ -853,19 +900,38 @@ def _sanitize_and_validate_overview(
                     or ("enterprise" in stated_aud_low and "individual" in site_aud_low)
                 ):
                     overview.target_audience.has_conflict = True
-                    conflict_note = f"Audience discrepancy: User stated '{stated_audience}', but website indicates '{overview.target_audience.description}'."
-                    if conflict_note not in overview.conflicts:
-                        overview.conflicts.append(conflict_note)
             overview.target_audience.is_explicit = True
 
         # Preserve business description from intake if overview is empty
         if not overview.business_description or overview.business_description.strip() in ("", "unknown"):
             overview.business_description = stated_name_desc
 
+    # 6. Sanitize brand messaging information
+    if not hasattr(overview, "messaging") or overview.messaging is None:
+        overview.messaging = MessagingInfo(core_messages=[], brand_tone=None, recurring_themes=[])
+    else:
+        if not isinstance(overview.messaging.core_messages, list):
+            overview.messaging.core_messages = []
+        else:
+            overview.messaging.core_messages = [
+                str(m).strip() for m in overview.messaging.core_messages if m and str(m).strip()
+            ]
+        if overview.messaging.brand_tone is not None:
+            if isinstance(overview.messaging.brand_tone, str):
+                cleaned_tone = overview.messaging.brand_tone.strip()
+                overview.messaging.brand_tone = cleaned_tone or None
+            else:
+                overview.messaging.brand_tone = None
+        if not isinstance(overview.messaging.recurring_themes, list):
+            overview.messaging.recurring_themes = []
+        else:
+            overview.messaging.recurring_themes = [
+                str(t).strip() for t in overview.messaging.recurring_themes if t and str(t).strip()
+            ]
+
     logger.info(
-        "[business_overview_trace] [CHECKPOINT 5: sanitization] Sanitization complete: %d verified sources in sources_used, %d conflicts detected.",
+        "[business_overview_trace] [CHECKPOINT 5: sanitization] Sanitization complete: %d verified sources in sources_used.",
         len(overview.sources_used),
-        len(overview.conflicts),
     )
 
     return overview
@@ -1149,9 +1215,10 @@ async def generate_business_overview(
             )
 
         logger.info(
-            "[business_overview_trace] [CHECKPOINT 4: raw_llm_response] Received raw LLM response: %d products, %d VPs.",
+            "[business_overview_trace] [CHECKPOINT 4: raw_llm_response] Received raw LLM response: %d products, %d VPs, %d core messages.",
             len(parsed_overview.products_and_services),
             len(parsed_overview.positioning_and_value_propositions),
+            len(parsed_overview.messaging.core_messages) if parsed_overview.messaging else 0,
         )
 
         # 7. Validate and sanitize source URLs against pages actually supplied in prompt
@@ -1208,3 +1275,61 @@ async def generate_business_overview(
             execution_time_seconds=round(time.perf_counter() - start_time, 2),
             error_message=err_msg,
         )
+
+
+class DatabasePersistenceError(RuntimeError):
+    """Raised when persisting a BusinessOverview to the database fails."""
+
+    pass
+
+
+def save_business_overview(
+    db: Session,
+    business_overview: BusinessOverview,
+) -> Any:
+    """Persist a successfully synthesized BusinessOverview into PostgreSQL.
+
+    Creates a new immutable record without modifying or overwriting existing entries.
+    Stores complete structured BusinessOverview data (including messaging) as JSONB.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        business_overview: The validated BusinessOverview to persist.
+
+    Returns:
+        The newly created BusinessOverviewModel instance.
+
+    Raises:
+        DatabasePersistenceError: If the database operation fails.
+    """
+    if business_overview is None:
+        raise ValueError("Cannot persist None business_overview.")
+
+    from backend.app.models.business_overview import BusinessOverviewModel
+
+    try:
+        overview_dict = business_overview.model_dump(mode="json")
+        record = BusinessOverviewModel(
+            id=uuid.uuid4(),
+            business_name=business_overview.business_name,
+            website_url=business_overview.website_url,
+            overview_data=overview_dict,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        logger.info(
+            "Successfully persisted new BusinessOverview record (id=%s) for '%s' (business: '%s').",
+            record.id,
+            record.website_url,
+            record.business_name,
+        )
+        return record
+    except Exception as exc:
+        db.rollback()
+        logger.exception(
+            "Database error while persisting BusinessOverview for '%s': %s",
+            business_overview.website_url,
+            exc,
+        )
+        raise DatabasePersistenceError("Failed to save business overview to database.") from exc

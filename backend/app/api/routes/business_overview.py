@@ -15,9 +15,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from langgraph.graph.state import CompiledStateGraph
+from sqlalchemy.orm import Session
 
 from backend.app.agent.graph import get_graph
 from backend.app.agent.state import AgentState
+from backend.app.db import get_db, get_db_context
 from backend.app.schemas.business_form import BusinessForm
 from backend.app.schemas.business_overview_response import (
     BusinessOverviewMetadata,
@@ -26,6 +28,7 @@ from backend.app.schemas.business_overview_response import (
 from backend.app.services.business_overview_service import (
     BusinessOverview,
     BusinessOverviewResult,
+    save_business_overview,
 )
 from backend.app.services.sitemap_fallback_service import WebsiteURLDiscoveryResult
 from backend.app.services.website_content_crawler_service import WebsiteCrawlResult
@@ -64,6 +67,7 @@ router = APIRouter(tags=["Business Overview"])
 async def generate_business_overview_endpoint(
     business_form: BusinessForm,
     graph: CompiledStateGraph = Depends(get_graph),
+    db: Session = Depends(get_db),
 ) -> BusinessOverviewResponse:
     """Execute the Competitor Marketing Agent workflow and return the synthesized business overview."""
     target_url = str(business_form.business_website)
@@ -175,7 +179,17 @@ async def generate_business_overview_endpoint(
             detail=err_detail,
         )
 
-    # 7. Construct response metadata
+    # 7. Persist business overview to database (creates a new immutable record)
+    try:
+        save_business_overview(db, business_overview)
+    except Exception as exc:
+        logger.exception("Failed to persist business overview for '%s': %s", target_url, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save business overview to database.",
+        )
+
+    # 8. Construct response metadata
     metadata = BusinessOverviewMetadata(
         website_url=target_url,
         total_candidates_discovered=len(final_state.get("candidate_urls") or []),
@@ -376,7 +390,21 @@ async def generate_business_overview_stream_endpoint(
                 yield f"data: {json.dumps(err_payload)}\n\n"
                 return
 
-            # Success: Build response payload
+            # Success: Persist business overview to database (creates a new immutable record)
+            try:
+                with get_db_context() as db:
+                    save_business_overview(db, business_overview)
+            except Exception as exc:
+                logger.exception("Failed to persist business overview during stream for '%s': %s", target_url, exc)
+                err_payload = {
+                    "stage": "error",
+                    "message": "Failed to save business overview to database.",
+                    "meta": {"error_type": "database_persistence_error"},
+                }
+                yield f"data: {json.dumps(err_payload)}\n\n"
+                return
+
+            # Build response payload
             metadata = BusinessOverviewMetadata(
                 website_url=target_url,
                 total_candidates_discovered=len(final_state.get("candidate_urls") or []),

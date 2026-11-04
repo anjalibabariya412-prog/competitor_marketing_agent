@@ -34,20 +34,25 @@ from .website_content_crawler_service import (
 from .business_overview_service import (
     BusinessOverview,
     BusinessOverviewResult,
+    DatabasePersistenceError,
     InformationGap,
+    MessagingInfo,
     ProductServiceItem,
     TargetAudienceInfo,
     ValueProposition,
     generate_business_overview,
+    save_business_overview,
 )
 
 __all__ = [
     "BusinessOverview",
     "BusinessOverviewResult",
     "CandidateURL",
+    "DatabasePersistenceError",
     "FailedPageScrape",
     "HomepageFetchResult",
     "InformationGap",
+    "MessagingInfo",
     "PageSelectionDecision",
     "PageSelectionResult",
     "ProductServiceItem",
@@ -59,6 +64,7 @@ __all__ = [
     "WebsiteCrawlResult",
     "WebsitePipelineResult",
     "WebsiteURLDiscoveryResult",
+    "save_business_overview",
     "check_category_coverage",
     "classify_page_type",
     "crawl_selected_pages",
