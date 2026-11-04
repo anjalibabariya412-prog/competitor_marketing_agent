@@ -78,6 +78,70 @@ class Settings(BaseSettings):
         default=240,
         description="Maximum execution timeout in seconds for Apify website content crawler actor.",
     )
+    CRAWLER_PAGE_LOAD_TIMEOUT_SECONDS: int = Field(
+        default=25,
+        description="Maximum seconds to wait for page load in crawler actor.",
+    )
+    CRAWLER_MAX_REQUEST_RETRIES: int = Field(
+        default=1,
+        description="Maximum request retries for crawler actor on failed pages.",
+    )
+    CRAWLER_HARD_TIMEOUT_SECONDS: int = Field(
+        default=90,
+        description="Hard maximum execution timeout in seconds for crawler actor execution.",
+    )
+    SCRAPE_CACHE_ENABLED: bool = Field(
+        default=True,
+        description="Whether to reuse recently cached crawl results for the same domain.",
+    )
+    SCRAPE_CACHE_TTL_HOURS: int = Field(
+        default=24,
+        description="Time-to-live in hours for cached domain crawl results.",
+    )
+    CRAWLER_ENABLE_FALLBACK_CANDIDATES: bool = Field(
+        default=True,
+        description="Whether to attempt crawling fallback candidate URLs if primary selected pages fail.",
+    )
+    CRAWLER_BROWSER_ONLY_ON_HTTP_BLOCK: bool = Field(
+        default=True,
+        description="Whether to instruct browser fallback to use playwright:chrome directly when direct HTTP is known to be blocked.",
+    )
+    CRAWLER_MAX_CONCURRENCY_ACTOR: int = Field(
+        default=6,
+        ge=1,
+        le=10,
+        description="Maximum concurrent pages crawled inside the Apify actor.",
+    )
+    CRAWLER_PAGE_LOAD_TIMEOUT_SECS: int = Field(
+        default=25,
+        ge=5,
+        le=120,
+        description="Page load timeout in seconds inside the crawler actor.",
+    )
+    CRAWLER_NAVIGATION_TIMEOUT_SECS: int = Field(
+        default=25,
+        ge=5,
+        le=120,
+        description="Navigation timeout in seconds inside the crawler actor.",
+    )
+    PAGE_SELECTION_COLLECTION_CAP: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum number of collection/category pages to select before prioritizing detail pages.",
+    )
+    ENABLE_REGIONAL_CONTEXT_DETECTION: bool = Field(
+        default=True,
+        description="Whether to detect regional/geo prefixes in crawled URLs and pass context to the LLM prompt.",
+    )
+    ENABLE_JSON_REPAIR_RETRY: bool = Field(
+        default=True,
+        description="Whether to attempt a single JSON repair retry if LLM structured parsing fails.",
+    )
+    ENABLE_EMERGENCY_OVERVIEW: bool = Field(
+        default=False,
+        description="Whether to generate an emergency best-effort overview on crawl failure.",
+    )
     HOMEPAGE_RENDER_WAIT_MS: int = Field(
         default=1500,
         ge=0,
@@ -113,6 +177,14 @@ class Settings(BaseSettings):
     MIN_HOMEPAGE_ADEQUACY_CHARS: int = Field(
         default=50,
         description="Minimum character threshold for homepage content to be considered adequate.",
+    )
+    MIN_FALLBACK_EXTRACT_CHARS: int = Field(
+        default=500,
+        description="Threshold below which layered fallback extraction is triggered for HTML content.",
+    )
+    MIN_USABLE_PAGE_CHARS: int = Field(
+        default=300,
+        description="Minimum character count for a scraped page to be treated as a full primary page in LLM synthesis.",
     )
     MAX_COMPETITORS: int = Field(
         default=5,

@@ -373,6 +373,91 @@ async def _website_crawling_node_impl(state: AgentState) -> dict[str, Any]:
                 "errors": existing_errors,
             }
 
+    # 4b. Dynamic fallback candidate crawling if some selected pages failed
+    enable_fallback = getattr(settings, "CRAWLER_ENABLE_FALLBACK_CANDIDATES", True)
+    if (
+        isinstance(enable_fallback, bool)
+        and enable_fallback
+        and crawl_result is not None
+        and bool(crawl_result.failed_pages)
+    ):
+        selection_res = state.get("selection_result") if isinstance(state, dict) else None
+        raw_fallbacks = getattr(selection_res, "fallback_candidates", None) or (
+            selection_res.get("fallback_candidates") if isinstance(selection_res, dict) else None
+        )
+        if isinstance(raw_fallbacks, list) and raw_fallbacks:
+            current_scraped_urls = {
+                _normalize_url_for_merge(p.url) for p in crawl_result.scraped_pages
+            }
+            attempted_urls = {
+                _normalize_url_for_merge(p.url) for p in pages_to_crawl
+            }
+            if homepage_scraped_page and homepage_scraped_page.url:
+                attempted_urls.add(_normalize_url_for_merge(homepage_scraped_page.url))
+
+            crawler_max_pages_val = (
+                max(1, settings.MAX_PAGES_USER_SITE - 1)
+                if is_homepage_reusable
+                else settings.MAX_PAGES_USER_SITE
+            )
+            needed_slots = min(
+                len(crawl_result.failed_pages),
+                crawler_max_pages_val - len(crawl_result.scraped_pages),
+            )
+            if needed_slots > 0:
+                candidates_to_try: list[SelectedPage] = []
+                for fb in raw_fallbacks:
+                    if isinstance(fb, SelectedPage):
+                        fb_page = fb
+                    elif isinstance(fb, dict):
+                        try:
+                            fb_page = SelectedPage(**fb)
+                        except Exception:
+                            continue
+                    elif isinstance(fb, str):
+                        fb_page = SelectedPage(url=fb)
+                    else:
+                        continue
+
+                    norm_fb = _normalize_url_for_merge(fb_page.url)
+                    if norm_fb not in attempted_urls and norm_fb not in current_scraped_urls:
+                        candidates_to_try.append(fb_page)
+                        attempted_urls.add(norm_fb)
+                    if len(candidates_to_try) >= needed_slots:
+                        break
+
+                if candidates_to_try:
+                    logger.info(
+                        "Attempting dynamic fallback crawling for %d candidate page(s) to replace failed pages: %s",
+                        len(candidates_to_try),
+                        [c.url for c in candidates_to_try],
+                    )
+                    try:
+                        fb_crawl_res = await crawl_selected_pages(
+                            pages=candidates_to_try,
+                            website_url=clean_url,
+                            max_pages=len(candidates_to_try),
+                        )
+                        if fb_crawl_res and fb_crawl_res.scraped_pages:
+                            logger.info(
+                                "Fallback crawling successfully recovered %d additional page(s).",
+                                len(fb_crawl_res.scraped_pages),
+                            )
+                            for sp in fb_crawl_res.scraped_pages:
+                                sp_norm = _normalize_url_for_merge(sp.url)
+                                if sp_norm not in current_scraped_urls:
+                                    crawl_result.scraped_pages.append(sp)
+                                    current_scraped_urls.add(sp_norm)
+
+                            crawl_result.total_scraped = len(crawl_result.scraped_pages)
+                            crawl_result.has_usable_content = (
+                                crawl_result.has_usable_content or fb_crawl_res.has_usable_content
+                            )
+                            if crawl_result.status in ("failed", "empty") and crawl_result.has_usable_content:
+                                crawl_result.status = "partial" if crawl_result.failed_pages else "success"
+                    except Exception as fb_exc:
+                        logger.warning("Fallback candidate crawling failed: %s", fb_exc)
+
     # 5. Handle complete internal crawl failure (0 scraped pages or no usable content)
     merged_pages = _merge_homepage_into_scraped_pages(
         homepage_scraped_page,

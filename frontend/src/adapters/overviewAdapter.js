@@ -101,23 +101,29 @@ export function adaptBusinessOverview(rawResponse) {
   });
 
   // 2. Who you serve (Target audience)
+  const rawConflicts = Array.isArray(overview.conflicts) ? overview.conflicts.filter(Boolean) : [];
+  const primaryConflict = rawConflicts.length > 0 ? rawConflicts[0] : null;
+
   const rawAudience = overview.target_audience;
   let audience = {
     description: 'Your audience is inferred from your website offerings and tone.',
     userStated: null,
     provenance: deriveProvenance({}),
-    hasConflict: false,
+    hasConflict: Boolean(primaryConflict),
+    conflictReason: primaryConflict,
   };
 
   if (typeof rawAudience === 'string') {
     audience.description = rawAudience;
     audience.provenance = deriveProvenance({});
   } else if (rawAudience && typeof rawAudience === 'object') {
+    const hasAudienceConflict = Boolean(rawAudience.has_conflict) || Boolean(primaryConflict);
     audience = {
       description: rawAudience.description || rawAudience.website_inferred || 'Audience inferred from your website.',
       userStated: rawAudience.user_stated_audience || rawAudience.user_stated || null,
-      provenance: deriveProvenance(rawAudience),
-      hasConflict: Boolean(rawAudience.has_conflict),
+      provenance: deriveProvenance({ ...rawAudience, has_conflict: hasAudienceConflict }),
+      hasConflict: hasAudienceConflict,
+      conflictReason: primaryConflict || (rawAudience.has_conflict ? 'Website audience differs from stated intake' : null),
       demographics: Array.isArray(rawAudience.core_demographics) ? rawAudience.core_demographics : [],
       needs: Array.isArray(rawAudience.key_needs) ? rawAudience.key_needs : [],
     };
@@ -172,6 +178,7 @@ export function adaptBusinessOverview(rawResponse) {
     positioning,
     informationGaps,
     sourcesUsed,
+    conflicts: rawConflicts,
   };
 }
 

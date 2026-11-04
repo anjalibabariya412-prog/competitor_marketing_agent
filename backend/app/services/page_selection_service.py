@@ -72,7 +72,6 @@ class SelectionCategory(str, Enum):
 
 
 PAGE_TYPE_PRIORITY: dict[PageType, int] = {
-     PageType.HOME: 100,
     PageType.HOME: 100,
     PageType.PRICING: 95,
     PageType.PRODUCT: 90,
@@ -83,9 +82,35 @@ PAGE_TYPE_PRIORITY: dict[PageType, int] = {
     PageType.FAQ: 65,
     PageType.BLOG: 35,
     PageType.OTHER: 30,
-    PageType.POLICY: 25,
+    PageType.POLICY: 10,
     PageType.UNKNOWN: 15,
 }
+
+_PENALIZED_LOW_VALUE_REGEX: re.Pattern[str] = re.compile(
+    r"/(?:terms|privacy|policy|policies|shipping|returns|refund|refunds|careers|jobs|login|signin|signup|cart|checkout|account|legal|disclaimer)(?:/|\.html|\.php|$|[?#])",
+    re.IGNORECASE,
+)
+
+_LOW_VALUE_TEXT_TERMS: tuple[str, ...] = (
+    "terms",
+    "privacy",
+    "policy",
+    "policies",
+    "shipping",
+    "returns",
+    "refund",
+    "refunds",
+    "careers",
+    "jobs",
+    "login",
+    "sign in",
+    "sign up",
+    "cart",
+    "checkout",
+    "my account",
+    "legal",
+    "disclaimer",
+)
 
 SECTION_PRIORITY_BONUS: dict[str, int] = {
     "nav": 15,
@@ -140,6 +165,10 @@ class PageSelectionResult(BaseModel):
     selected_pages: list[SelectedPage] = Field(
         default_factory=list,
         description="Final selected candidate pages for downstream crawling.",
+    )
+    fallback_candidates: list[SelectedPage] = Field(
+        default_factory=list,
+        description="Ranked remaining candidate URLs available if top selected pages fail.",
     )
     total_selected: int = Field(default=0, description="Number of pages selected.")
     selection_method: Literal["llm", "deterministic_fallback", "empty"] = Field(
@@ -216,9 +245,10 @@ def categorize_candidate(candidate: CandidateURL, base_url: str = "") -> Selecti
         "offer", "offers", "deals", "deal", "discount", "discounts",
         "promo", "promotions", "sale", "clearance", "coupons", "coupon",
         "bundle", "bundles", "membership", "memberships", "voucher", "combo",
+        "gold", "club", "loyalty", "rewards", "bogo", "combos", "cashback", "savings",
     )
     path_tokens = set(re.split(r"[-_/]", path))
-    if any(t in path_tokens for t in pricing_tokens) or any(t in text for t in ("pricing", "plans", "rates", "subscription", "packages", "deals", "offers", "sale", "discount", "bundle", "bundles", "coupons", "membership")):
+    if any(t in path_tokens for t in pricing_tokens) or any(t in text for t in ("pricing", "plans", "rates", "subscription", "packages", "deals", "offers", "sale", "discount", "bundle", "bundles", "coupons", "membership", "gold", "club", "loyalty", "rewards", "bogo", "cashback", "savings")):
         return SelectionCategory.PRICING_OFFER
 
     # 4. Contact & Booking
@@ -304,6 +334,58 @@ def _count_stem_occurrences(url: str, selected_urls: set[str]) -> int:
     return sum(1 for sel in selected_urls if _get_path_stem(sel) == stem)
 
 
+def _is_collection_page(url: str) -> bool:
+    """Determine whether a candidate URL points to a product category/collection listing."""
+    norm = url.lower()
+    return any(seg in norm for seg in ("/collection", "/collections", "/category", "/categories"))
+
+
+def rank_candidate_score(
+    c: CandidateURL,
+    keywords: list[str] | None = None,
+    product_phrase: str = "",
+    has_matches: bool = False,
+    total_candidates: int = 0,
+    max_pages: int = DEFAULT_MAX_SELECTED_PAGES,
+) -> tuple[int, int, str]:
+    """Score a candidate URL for priority ranking.
+
+    Higher score indicates higher priority. Path segment count acts as tie-breaker
+    (fewer path segments prioritized). Canonical URL acts as final deterministic tie-breaker.
+    """
+    type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
+    section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
+    relevance = calculate_product_relevance(c, keywords or [], product_phrase) if (keywords or product_phrase) else 0
+    total_score = type_score + section_score + relevance
+
+    # Collection / category boost
+    if _is_collection_page(c.url):
+        total_score += 40
+
+    # Sub-type bonuses within category
+    if c.page_type == PageType.FAQ:
+        total_score += 10
+    elif c.page_type == PageType.POLICY:
+        norm_url = c.url.lower()
+        if any(term in norm_url for term in ("shipping", "refund", "return", "delivery")):
+            total_score += 10
+        elif any(term in norm_url for term in ("privacy", "terms", "cookie")):
+            total_score -= 15
+
+    # When matching product pages exist, penalize unrelated product pages
+    if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
+        total_score -= 60
+
+    # Low-value penalty when total candidates exceed selection capacity
+    if total_candidates > max_pages:
+        norm_text = (c.link_text or "").lower()
+        if _PENALIZED_LOW_VALUE_REGEX.search(c.url) or any(t in norm_text for t in _LOW_VALUE_TEXT_TERMS):
+            total_score -= 50
+
+    path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
+    return (total_score, -path_segments, c.url)
+
+
 # ---------------------------------------------------------------------------
 # Deterministic Balanced Page Selection Implementation
 # ---------------------------------------------------------------------------
@@ -380,47 +462,35 @@ def select_pages_deterministic(
 
     # 4. Helper to score and rank candidates within their category
     def _rank_candidate(c: CandidateURL) -> tuple[int, int, str]:
-        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
-        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
-        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
-        total_score = type_score + section_score + relevance
-
-        # Collection / category boost
-        norm_url = c.url.lower()
-        if any(seg in norm_url for seg in ("/collection", "/collections", "/category", "/categories")):
-            total_score += 40
-
-        # Sub-type bonuses within category
-        if c.page_type == PageType.FAQ:
-            total_score += 10
-        elif c.page_type == PageType.POLICY:
-            if any(term in norm_url for term in ("shipping", "refund", "return", "delivery")):
-                total_score += 10
-            elif any(term in norm_url for term in ("privacy", "terms", "cookie")):
-                total_score -= 15
-
-        # When matching product pages exist, penalize unrelated product pages
-        if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
-            total_score -= 60
-
-        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
-        return (total_score, -path_segments, c.url)
+        return rank_candidate_score(
+            c,
+            keywords=keywords,
+            product_phrase=product_phrase,
+            has_matches=has_matches,
+            total_candidates=len(unique_candidates),
+            max_pages=max_pages,
+        )
 
     # Sort each category bucket by ranking score
     for cat in buckets:
         buckets[cat].sort(key=_rank_candidate, reverse=True)
 
     # 5. Execute Multi-Stage Priority Budgeting
+    collection_cap = getattr(settings, "PAGE_SELECTION_COLLECTION_CAP", 2)
+    selected_collection_count = 0
     selected_pages: list[SelectedPage] = []
     selected_urls: set[str] = set()
 
     def _add_page(candidate: CandidateURL, reason: str) -> bool:
+        nonlocal selected_collection_count
         if len(selected_pages) >= max_pages:
             return False
         norm_key = candidate.url.lower().rstrip("/")
         if norm_key in selected_urls:
             return False
         selected_urls.add(norm_key)
+        if _is_collection_page(candidate.url):
+            selected_collection_count += 1
         selected_pages.append(
             SelectedPage(
                 url=candidate.url,
@@ -482,6 +552,15 @@ def select_pages_deterministic(
             stem_count = _count_stem_occurrences(pc.url, selected_urls)
             if has_diverse_stems and stem_count >= 1:
                 continue
+
+            # If collection cap reached, prefer non-collection product pages
+            if _is_collection_page(pc.url) and selected_collection_count >= collection_cap:
+                has_non_collection = any(
+                    not _is_collection_page(other.url) and other.url.lower().rstrip("/") not in selected_urls
+                    for other in prod_queue
+                )
+                if has_non_collection:
+                    continue
 
             rel = calculate_product_relevance(pc, keywords, product_phrase) if keywords else 0
             type_name = pc.page_type.value if hasattr(pc.page_type, "value") else str(pc.page_type)
@@ -555,6 +634,15 @@ def select_pages_deterministic(
             if len(selected_pages) >= max_pages:
                 break
 
+            # If collection cap reached, prefer non-collection candidate pages
+            if _is_collection_page(rem_c.url) and selected_collection_count >= collection_cap:
+                has_non_collection = any(
+                    not _is_collection_page(other.url) and other.url.lower().rstrip("/") not in selected_urls
+                    for other in ordered_backfill
+                )
+                if has_non_collection:
+                    continue
+
             rel = calculate_product_relevance(rem_c, keywords, product_phrase) if keywords else 0
             type_name = rem_c.page_type.value if hasattr(rem_c.page_type, "value") else str(rem_c.page_type)
             if rel > 0:
@@ -566,11 +654,30 @@ def select_pages_deterministic(
 
             _add_page(rem_c, reason)
 
+    # Collect ranked fallback candidates from remaining unselected candidates
+    fallback_candidates: list[SelectedPage] = []
+    unselected = [
+        c for c in unique_candidates
+        if c.url.lower().rstrip("/") not in selected_urls
+    ]
+    unselected.sort(key=_rank_candidate, reverse=True)
+    for c in unselected:
+        fallback_candidates.append(
+            SelectedPage(
+                url=c.url,
+                page_type=c.page_type,
+                link_text=c.link_text,
+                source_section=c.source_section,
+                selection_reason=f"Fallback candidate ranked {len(fallback_candidates) + 1} by deterministic scoring.",
+            )
+        )
+
     count = len(selected_pages)
     logger.info("Deterministic selection selected %d page(s) (cap: %d).", count, max_pages)
 
     return PageSelectionResult(
         selected_pages=selected_pages,
+        fallback_candidates=fallback_candidates,
         total_selected=count,
         selection_method="deterministic_fallback",
         model_used=None,
@@ -608,12 +715,14 @@ def _select_balanced_candidates_for_prompt(
         buckets[cat].append(c)
 
     def _sort_key(c: CandidateURL) -> tuple[int, int, str]:
-        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
-        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
-        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
-        total_score = type_score + section_score + relevance
-        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
-        return (total_score, -path_segments, c.url)
+        return rank_candidate_score(
+            c,
+            keywords=keywords,
+            product_phrase=product_phrase,
+            has_matches=False,
+            total_candidates=len(candidates),
+            max_pages=max_prompt_candidates,
+        )
 
     for cat in buckets:
         buckets[cat].sort(key=_sort_key, reverse=True)
@@ -712,28 +821,14 @@ def is_selection_ambiguous(
 
     # Score and rank candidates using deterministic rank function
     def _rank_candidate(c: CandidateURL) -> tuple[int, int, str]:
-        type_score = PAGE_TYPE_PRIORITY.get(c.page_type, 15)
-        section_score = SECTION_PRIORITY_BONUS.get(c.source_section, 0)
-        relevance = calculate_product_relevance(c, keywords, product_phrase) if keywords else 0
-        total_score = type_score + section_score + relevance
-
-        norm_url = c.url.lower()
-        if any(seg in norm_url for seg in ("/collection", "/collections", "/category", "/categories")):
-            total_score += 40
-
-        if c.page_type == PageType.FAQ:
-            total_score += 10
-        elif c.page_type == PageType.POLICY:
-            if any(term in norm_url for term in ("shipping", "refund", "return", "delivery")):
-                total_score += 10
-            elif any(term in norm_url for term in ("privacy", "terms", "cookie")):
-                total_score -= 15
-
-        if has_matches and relevance == 0 and c.page_type == PageType.PRODUCT:
-            total_score -= 60
-
-        path_segments = len([s for s in urllib.parse.urlsplit(c.url).path.split("/") if s])
-        return (total_score, -path_segments, c.url)
+        return rank_candidate_score(
+            c,
+            keywords=keywords,
+            product_phrase=product_phrase,
+            has_matches=has_matches,
+            total_candidates=len(unique_candidates),
+            max_pages=max_pages,
+        )
 
     ranked = sorted(unique_candidates, key=_rank_candidate, reverse=True)
 
@@ -878,6 +973,7 @@ async def select_pages_with_llm(
         formatted_lines.append(f"- URL: {c.url} | Category: {type_str} | Found in: {c.source_section}{text_snippet}")
 
     product_phrase = product_or_service.strip() if product_or_service else ""
+    keywords = extract_product_keywords(product_or_service) if product_or_service else []
     product_context = f"Target Product / Service: {product_phrase}\n" if product_phrase else ""
     system_prompt = PAGE_SELECTION_SYSTEM_PROMPT.format(max_pages=max_pages, homepage_url=website_url)
     user_prompt = PAGE_SELECTION_USER_PROMPT_TEMPLATE.format(
@@ -1014,6 +1110,38 @@ async def select_pages_with_llm(
                     seen_urls.add(fb_norm)
                     validated_pages.append(fb_page)
 
+        # Collect fallback candidates from all unselected candidates
+        fallback_candidates: list[SelectedPage] = []
+        seen_fallback_urls = set(seen_urls)
+        unselected_candidates: list[CandidateURL] = []
+        for c in candidates:
+            c_norm = c.url.lower().rstrip("/")
+            if c_norm not in seen_fallback_urls:
+                seen_fallback_urls.add(c_norm)
+                unselected_candidates.append(c)
+
+        unselected_candidates.sort(
+            key=lambda c: rank_candidate_score(
+                c,
+                keywords=keywords,
+                product_phrase=product_phrase,
+                has_matches=False,
+                total_candidates=len(candidates),
+                max_pages=max_pages,
+            ),
+            reverse=True,
+        )
+        for c in unselected_candidates:
+            fallback_candidates.append(
+                SelectedPage(
+                    url=c.url,
+                    page_type=c.page_type,
+                    link_text=c.link_text,
+                    source_section=c.source_section,
+                    selection_reason=f"Fallback candidate ranked {len(fallback_candidates) + 1}.",
+                )
+            )
+
         logger.info(
             "OpenAI page selection successfully selected %d page(s) for %s.",
             len(validated_pages),
@@ -1021,6 +1149,7 @@ async def select_pages_with_llm(
         )
         return PageSelectionResult(
             selected_pages=validated_pages,
+            fallback_candidates=fallback_candidates,
             total_selected=len(validated_pages),
             selection_method="llm",
             model_used=selected_model,

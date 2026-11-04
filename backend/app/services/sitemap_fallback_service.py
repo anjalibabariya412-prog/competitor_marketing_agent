@@ -27,6 +27,10 @@ import httpx
 from pydantic import BaseModel, Field
 
 from backend.app.schemas.enums import PageType
+from backend.app.services.content_validation import (
+    is_domain_http_blocked,
+    mark_domain_http_blocked,
+)
 from .homepage_service import HomepageFetchResult, fetch_homepage
 from .url_extractor_service import (
     CandidateURL,
@@ -312,22 +316,28 @@ def _extract_sitemap_elements(root: ET.Element) -> tuple[list[str], list[str]]:
 async def _discover_sitemaps_from_robots(
     client: httpx.AsyncClient,
     base_url: str,
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, bool]:
     """Fetch robots.txt and extract all declared Sitemap directives.
 
     Returns:
-        (discovered_sitemap_urls, is_rate_limited)
+        (discovered_sitemap_urls, is_rate_limited, is_blocked)
     """
     parsed = urllib.parse.urlsplit(base_url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     discovered: list[str] = []
     is_rate_limited = False
+    is_blocked = False
 
     try:
         resp = await client.get(robots_url)
         if resp.status_code == 429:
+            mark_domain_http_blocked(robots_url, "robots_txt_http_429")
             logger.warning("Robots.txt probe '%s' returned HTTP 429 (rate limited).", robots_url)
-            return [], True
+            return [], True, False
+        if resp.status_code in (401, 403):
+            mark_domain_http_blocked(robots_url, f"robots_txt_http_{resp.status_code}")
+            logger.warning("Robots.txt probe '%s' blocked by server (HTTP %d).", robots_url, resp.status_code)
+            return [], False, True
         if resp.status_code == 200 and resp.text:
             for line in resp.text.splitlines():
                 line = line.strip()
@@ -342,7 +352,7 @@ async def _discover_sitemaps_from_robots(
     except Exception as exc:
         logger.debug("Robots.txt check failed for %s: %s", robots_url, exc)
 
-    return discovered, is_rate_limited
+    return discovered, is_rate_limited, is_blocked
 
 
 def _get_common_sitemap_probe_urls(base_url: str) -> list[str]:
@@ -424,6 +434,21 @@ async def discover_sitemap_urls(
         )
 
     base_url = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+    if is_domain_http_blocked(base_url):
+        logger.info(
+            "Direct HTTP is already blocked for domain '%s'; skipping direct HTTP sitemap probes.",
+            base_url,
+        )
+        return SitemapDiscoveryResult(
+            base_url=base_url,
+            status="failed",
+            message="Direct HTTP is blocked for this domain; skipping sitemap probes.",
+            sitemaps_checked=[],
+            candidate_urls=[],
+            total_found=0,
+        )
+
     headers = {"User-Agent": _USER_AGENT, "Accept": "application/xml, text/xml, */*"}
 
     sitemaps_to_explore: list[tuple[str, int]] = []
@@ -436,7 +461,7 @@ async def discover_sitemap_urls(
         headers=headers,
     ) as client:
         # 1. Discover sitemaps declared in robots.txt
-        robots_sitemaps, robots_rate_limited = await _discover_sitemaps_from_robots(client, base_url)
+        robots_sitemaps, robots_rate_limited, robots_blocked = await _discover_sitemaps_from_robots(client, base_url)
         if robots_rate_limited:
             logger.warning(
                 "Robots.txt probe for %s returned HTTP 429 (rate limited). Stopping sitemap discovery.",
@@ -448,6 +473,21 @@ async def discover_sitemap_urls(
                 base_url=base_url,
                 status="rate_limited",
                 message="Sitemap discovery stopped: robots.txt returned HTTP 429 Too Many Requests.",
+                sitemaps_checked=[robots_url],
+                candidate_urls=[],
+                total_found=0,
+            )
+        if robots_blocked:
+            logger.warning(
+                "Robots.txt probe for %s blocked (HTTP 401/403). Stopping sitemap discovery.",
+                base_url,
+            )
+            parsed_robots = urllib.parse.urlsplit(base_url)
+            robots_url = f"{parsed_robots.scheme}://{parsed_robots.netloc}/robots.txt"
+            return SitemapDiscoveryResult(
+                base_url=base_url,
+                status="failed",
+                message="Sitemap discovery stopped: robots.txt returned HTTP 401/403 (blocked).",
                 sitemaps_checked=[robots_url],
                 candidate_urls=[],
                 total_found=0,
@@ -497,6 +537,7 @@ async def discover_sitemap_urls(
             try:
                 resp = await client.get(target_sitemap_url)
                 if resp.status_code == 429:
+                    mark_domain_http_blocked(target_sitemap_url, "sitemap_http_429")
                     logger.warning(
                         "Sitemap probe '%s' returned HTTP 429 (rate limited). Stopping additional sitemap probing.",
                         target_sitemap_url,
@@ -504,9 +545,14 @@ async def discover_sitemap_urls(
                     sitemap_rate_limited = True
                     break
                 elif resp.status_code in (401, 403):
+                    mark_domain_http_blocked(target_sitemap_url, f"sitemap_http_{resp.status_code}")
                     sitemaps_blocked += 1
-                    logger.warning("Sitemap probe '%s' blocked by server (HTTP %d).", target_sitemap_url, resp.status_code)
-                    continue
+                    logger.warning(
+                        "Sitemap probe '%s' blocked by server (HTTP %d). Stopping additional direct HTTP sitemap probes.",
+                        target_sitemap_url,
+                        resp.status_code,
+                    )
+                    break
                 elif resp.status_code == 404:
                     sitemaps_not_found += 1
                     logger.debug("Sitemap '%s' returned HTTP 404.", target_sitemap_url)
@@ -555,7 +601,7 @@ async def discover_sitemap_urls(
                             score += 100
                         if any(kw in u_low for kw in keywords):
                             score += 50
-                        if any(k in u_low for k in ("pricing", "price", "plan", "plans", "offer", "offers", "deal", "discount", "bundle")):
+                        if any(k in u_low for k in ("pricing", "price", "plan", "plans", "offer", "offers", "deal", "discount", "bundle", "membership", "gold", "club", "loyalty", "rewards", "coupons", "combos")):
                             score += 40
                         elif any(k in u_low for k in ("about", "story", "team", "who-we-are", "company", "mission")):
                             score += 35

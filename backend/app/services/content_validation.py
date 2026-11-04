@@ -7,10 +7,11 @@ a cookie-consent notice, or an active WAF/CAPTCHA block.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import urllib.parse
-from typing import Any
+from typing import Any, Literal, Sequence
 from bs4 import BeautifulSoup
 
 from backend.app.schemas.enums import PageType
@@ -70,6 +71,51 @@ _COOKIE_BOILERPLATE_REGEX = re.compile(
     r"onetrust|powered by onetrust|gdpr|strictly necessary cookies)\b"
 )
 
+# ---------------------------------------------------------------------------
+# Domain-Level HTTP Block Memory
+# ---------------------------------------------------------------------------
+
+_BLOCKED_HTTP_DOMAINS: set[str] = set()
+
+
+def _normalize_domain_host(url: str) -> str:
+    """Extract lowercase hostname stripped of www. prefix."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        netloc = (parsed.netloc or parsed.path).lower()
+        if ":" in netloc:
+            netloc = netloc.split(":", 1)[0]
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc.strip()
+    except Exception:
+        return ""
+
+
+def mark_domain_http_blocked(url: str, reason: str = "blocked") -> None:
+    """Record that a domain has blocked direct HTTP requests (e.g. 403, 429, WAF)."""
+    host = _normalize_domain_host(url)
+    if host:
+        _BLOCKED_HTTP_DOMAINS.add(host)
+        logger.info("[HTTP_BLOCK_CACHE] Domain '%s' marked as HTTP-blocked (reason: %s).", host, reason)
+
+
+def is_domain_http_blocked(url: str) -> bool:
+    """Check if direct HTTP requests for this domain should be skipped due to prior block."""
+    host = _normalize_domain_host(url)
+    return bool(host and host in _BLOCKED_HTTP_DOMAINS)
+
+
+def clear_domain_http_blocks() -> None:
+    """Clear in-memory HTTP-blocked domains (used in tests or fresh runs)."""
+    _BLOCKED_HTTP_DOMAINS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Content Adequacy & Validation
+# ---------------------------------------------------------------------------
 
 def is_blocked_content(text: str) -> bool:
     """Return True if text indicates an active CAPTCHA, WAF, or access block."""
@@ -156,10 +202,325 @@ def is_content_adequate(
     return True, "content_adequate"
 
 
+def compute_text_overlap_ratio(text: str, existing_texts: Sequence[str]) -> float:
+    """Compute the fraction of word 3-grams in `text` that appear in `existing_texts`.
+
+    Returns a float between 0.0 and 1.0 representing cross-page duplicate boilerplate ratio.
+    """
+    if not text or not existing_texts:
+        return 0.0
+    words = [w.lower() for w in re.findall(r"\b\w+\b", text)]
+    if len(words) < 3:
+        cand_words = set(words)
+        if not cand_words:
+            return 0.0
+        existing_words = {w.lower() for t in existing_texts for w in re.findall(r"\b\w+\b", t)}
+        return len(cand_words.intersection(existing_words)) / len(cand_words)
+
+    shingles_candidate = {tuple(words[i : i + 3]) for i in range(len(words) - 2)}
+    if not shingles_candidate:
+        return 0.0
+
+    all_existing_shingles: set[tuple[str, ...]] = set()
+    for t in existing_texts:
+        e_words = [w.lower() for w in re.findall(r"\b\w+\b", t)]
+        if len(e_words) >= 3:
+            all_existing_shingles.update(tuple(e_words[i : i + 3]) for i in range(len(e_words) - 2))
+
+    shared = shingles_candidate.intersection(all_existing_shingles)
+    return len(shared) / len(shingles_candidate)
+
+
+def evaluate_page_content_quality(
+    content: str,
+    page_type: PageType | str | None = None,
+    existing_texts: Sequence[str] | None = None,
+    url: str = "",
+) -> tuple[Literal["primary", "weak", "inadequate"], str]:
+    """Evaluate content substance, brevity, and cross-page duplication.
+
+    Returns:
+        (category, reason) where category is "primary", "weak", or "inadequate".
+    """
+    if not content or not content.strip():
+        return "inadequate", "empty_content"
+
+    text = content.strip()
+    if is_blocked_content(text):
+        return "inadequate", "blocked_content"
+
+    char_count = len(text)
+    if char_count < 100:
+        return "inadequate", f"insufficient_readable_content ({char_count} chars < 100)"
+
+    # Check for concise pricing or contact pages
+    lower = text.lower()
+    pt_str = page_type.value if hasattr(page_type, "value") else str(page_type or "").lower()
+    is_pricing_or_contact = (
+        pt_str in ("pricing", "contact", "policy")
+        or any(k in url.lower() for k in ("pricing", "plan", "contact", "support"))
+    )
+
+    if is_pricing_or_contact and char_count >= 100:
+        has_pricing_data = any(sym.lower() in lower for sym in ("$", "₹", "€", "£", "usd", "inr", "/mo", "/month", "/yr", "per year", "free tier", "pricing", "membership", "club", "gold", "bogo", "sale", "discount"))
+        has_contact_data = "@" in text or any(term in lower for term in ("email", "tel:", "phone", "contact us", "support@"))
+        if has_pricing_data or has_contact_data:
+            return "primary", "concise_specialized_page"
+
+    # Cross-page duplicate boilerplate check
+    if existing_texts:
+        overlap = compute_text_overlap_ratio(text, existing_texts)
+        if overlap >= 0.70:
+            return "weak", f"high_cross_page_overlap ({overlap:.0%})"
+
+    if char_count < 300:
+        return "weak", f"sparse_content ({char_count} chars < 300)"
+
+    return "primary", "substantive_content"
+
+
+
+# ---------------------------------------------------------------------------
+# Boilerplate Filtering & Layered Fallback Extraction
+# ---------------------------------------------------------------------------
+
+_BOILERPLATE_REGEXES: list[re.Pattern[str]] = [
+    re.compile(r"(?i)\b(we use cookies|cookie policy|cookie preferences|cookie settings|manage cookies|accept (?:all )?cookies|reject (?:all )?cookies|consent to our use of cookies|onetrust|powered by onetrust|cookiebot|strictly necessary cookies)\b[^\n\.]*[\n\.]?"),
+    re.compile(r"(?i)\b(you need to enable javascript|please enable javascript|javascript is (?:required|disabled|needed))\b[^\n\.]*[\n\.]?"),
+    re.compile(r"(?i)\b(attention required!\s*\|\s*cloudflare|cf-ray|ray id:\s*[a-f0-9]+|security check to continue|please verify you are a human)\b[^\n\.]*[\n\.]?"),
+    re.compile(r"(?i)\b(all rights reserved|copyright\s*(?:©|\(c\)|&copy;)?\s*\b\d{4}\b)[^\n\.]*[\n\.]?"),
+]
+
+
+def clean_boilerplate(text: str) -> str:
+    """Strip cookie consent notices, JS disabled notices, bot check messages, and copyright footers.
+
+    Removes boilerplate lines and inline boilerplate fragments while preserving substantive page text.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    cleaned_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+        lower = stripped.lower()
+        if any(sig in lower for sig in SPA_SKELETON_SIGNALS):
+            continue
+        if any(sig in lower for sig in DEFINITIVE_BLOCK_SIGNALS):
+            continue
+        if _COOKIE_BOILERPLATE_REGEX.search(stripped) and len(stripped) < 250:
+            continue
+        if "all rights reserved" in lower and (("copyright" in lower) or ("©" in lower) or ("(c)" in lower) or re.search(r"\b20\d\d\b", lower)):
+            continue
+        res = stripped
+        for reg in _BOILERPLATE_REGEXES:
+            res = reg.sub("", res).strip()
+        if res:
+            cleaned_lines.append(res)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _extract_from_json_ld_node(node: Any, lines: list[str]) -> None:
+    """Recursively traverse JSON-LD entity structures and append concise factual lines."""
+    if isinstance(node, list):
+        for item in node:
+            _extract_from_json_ld_node(item, lines)
+        return
+    if not isinstance(node, dict):
+        return
+
+    if "@graph" in node and isinstance(node["@graph"], list):
+        for item in node["@graph"]:
+            _extract_from_json_ld_node(item, lines)
+
+    node_type = str(node.get("@type") or node.get("type") or "").strip()
+    name = str(node.get("name") or "").strip()
+    legal_name = str(node.get("legalName") or "").strip()
+    desc = str(node.get("description") or "").strip()
+    slogan = str(node.get("slogan") or "").strip()
+
+    if any(t in node_type.lower() for t in ("organization", "store", "corporation", "localbusiness")):
+        display_name = name or legal_name
+        if name and legal_name and name.lower() != legal_name.lower():
+            display_name = f"{name} ({legal_name})"
+        entry = f"Organization: {display_name}" if display_name else "Organization"
+        if desc:
+            entry += f" - {desc}"
+        if slogan:
+            entry += f" (Slogan: {slogan})"
+        lines.append(entry)
+        knows_about = node.get("knowsAbout")
+        if isinstance(knows_about, list):
+            lines.append("Offerings / Specialties: " + ", ".join(str(k) for k in knows_about if k))
+        elif isinstance(knows_about, str) and knows_about:
+            lines.append(f"Offerings / Specialties: {knows_about}")
+
+    elif "website" in node_type.lower():
+        entry = f"Website: {name}" if name else "Website"
+        if desc:
+            entry += f" - {desc}"
+        lines.append(entry)
+
+    elif "product" in node_type.lower():
+        entry = f"Product: {name}" if name else "Product"
+        brand = node.get("brand")
+        if isinstance(brand, dict):
+            b_name = brand.get("name")
+            if b_name:
+                entry += f" (Brand: {b_name})"
+        elif isinstance(brand, str) and brand:
+            entry += f" (Brand: {brand})"
+        if desc:
+            entry += f" - {desc}"
+        offers = node.get("offers")
+        if isinstance(offers, dict):
+            price = offers.get("price")
+            curr = offers.get("priceCurrency") or ""
+            if price:
+                entry += f" [Price: {price} {curr}]"
+        elif isinstance(offers, list) and offers:
+            first_offer = offers[0]
+            if isinstance(first_offer, dict):
+                price = first_offer.get("price")
+                curr = first_offer.get("priceCurrency") or ""
+                if price:
+                    entry += f" [Price: {price} {curr}]"
+        lines.append(entry)
+
+    elif "service" in node_type.lower():
+        entry = f"Service: {name}" if name else "Service"
+        if desc:
+            entry += f" - {desc}"
+        lines.append(entry)
+
+    elif any(t in node_type.lower() for t in ("itemlist", "breadcrumblist")):
+        items = node.get("itemListElement") or []
+        item_names = []
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    it_name = it.get("name") or (it.get("item", {}).get("name") if isinstance(it.get("item"), dict) else None)
+                    if it_name:
+                        item_names.append(str(it_name).strip())
+        if item_names:
+            lines.append("Catalog Items: " + ", ".join(item_names))
+
+    elif name or desc:
+        entry = f"{node_type or 'Item'}: {name}" if name else (node_type or "Item")
+        if desc:
+            entry += f" - {desc}"
+        lines.append(entry)
+
+
+def extract_structured_fallback_text(html: str) -> str:
+    """Extract structured fallback text from JSON-LD schema, meta tags, headings, and CTAs.
+
+    Used when primary HTML body text is too short (< MIN_FALLBACK_EXTRACT_CHARS) or empty (e.g. SPAs).
+    """
+    if not html or not html.strip():
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Parse JSON-LD scripts
+        json_ld_lines: list[str] = []
+        for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+            try:
+                raw_json = script.string or script.get_text()
+                if not raw_json:
+                    continue
+                data = json.loads(raw_json.strip())
+                _extract_from_json_ld_node(data, json_ld_lines)
+            except Exception:
+                continue
+
+        # 2. Extract Title & Meta Description
+        title = ""
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+        if not title:
+            og_title = soup.find("meta", attrs={"property": re.compile(r"^(og:title|twitter:title)$", re.I)})
+            if og_title and og_title.get("content"):
+                title = og_title["content"].strip()
+
+        meta_desc = ""
+        for tag in soup.find_all("meta"):
+            name = (tag.get("name") or tag.get("property") or "").lower()
+            content = (tag.get("content") or "").strip()
+            if not content:
+                continue
+            if name in ("description", "og:description", "twitter:description") and not meta_desc:
+                meta_desc = content
+
+        # 3. Headings
+        headings: list[str] = []
+        for h in soup.find_all(["h1", "h2", "h3"]):
+            htext = h.get_text(separator=" ", strip=True)
+            if htext and len(htext) > 2 and htext not in headings:
+                clean_h = clean_boilerplate(htext)
+                if clean_h:
+                    headings.append(f"- {clean_h}")
+
+        # 4. Buttons / CTAs
+        buttons: list[str] = []
+        for btn in soup.find_all(["button", "a"]):
+            is_btn = (
+                btn.name == "button"
+                or "btn" in (btn.get("class") or [])
+                or (btn.get("role") or "").lower() == "button"
+            )
+            if is_btn:
+                btext = btn.get_text(separator=" ", strip=True)
+                if btext and 3 < len(btext) < 60 and btext not in buttons:
+                    if not any(noise in btext.lower() for noise in ("menu", "close", "toggle", "open", "accept", "reject")):
+                        clean_b = clean_boilerplate(btext)
+                        if clean_b:
+                            buttons.append(clean_b)
+
+        # 5. Image Alt attributes
+        alts: list[str] = []
+        for img in soup.find_all("img"):
+            alt = (img.get("alt") or "").strip()
+            if alt and len(alt) >= 6 and alt not in alts:
+                if not any(noise in alt.lower() for noise in ("logo", "icon", "arrow", "spacer", "placeholder", "loading")):
+                    clean_a = clean_boilerplate(alt)
+                    if clean_a:
+                        alts.append(clean_a)
+
+        sections: list[str] = []
+        if title:
+            sections.append(f"[Page Title]\n{title}")
+        if meta_desc:
+            sections.append(f"[Meta Description]\n{meta_desc}")
+        if headings:
+            sections.append("[Key Headings]\n" + "\n".join(headings[:15]))
+        if json_ld_lines:
+            deduped_json: list[str] = []
+            seen_j: set[str] = set()
+            for jl in json_ld_lines:
+                if jl not in seen_j:
+                    seen_j.add(jl)
+                    deduped_json.append(jl)
+            sections.append("[Structured Data (JSON-LD)]\n" + "\n".join(deduped_json))
+        if buttons:
+            sections.append("[Key Actions & Offerings]\n" + "\n".join(f"- {b}" for b in buttons[:10]))
+        if alts:
+            sections.append("[Featured Visuals & Products]\n" + "\n".join(f"- {a}" for a in alts[:10]))
+
+        return "\n\n".join(sections)
+    except Exception:
+        return ""
+
+
 def extract_text_from_html(html: str) -> str:
     """Extract readable text from HTML by removing scripts, styles, and markup.
 
-    Preserves substantive page text while stripping noise tags.
+    Preserves substantive page text, cleans boilerplate, and if content is sparse
+    (< MIN_FALLBACK_EXTRACT_CHARS), augments with structured fallback.
     """
     if not html or not html.strip():
         return ""
@@ -167,7 +528,24 @@ def extract_text_from_html(html: str) -> str:
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
             tag.decompose()
-        return soup.get_text(separator=" ", strip=True)
+        raw_text = soup.get_text(separator=" ", strip=True)
+        cleaned = clean_boilerplate(raw_text)
+
+        min_fallback = 500
+        try:
+            from backend.app.core.config import settings
+            min_fallback = getattr(settings, "MIN_FALLBACK_EXTRACT_CHARS", 500)
+        except Exception:
+            pass
+
+        if len(cleaned) < min_fallback:
+            fallback = extract_structured_fallback_text(html)
+            if fallback:
+                if cleaned:
+                    return f"{cleaned}\n\n{fallback}".strip()
+                return fallback.strip()
+
+        return cleaned
     except Exception:
         return ""
 
@@ -316,5 +694,3 @@ def log_http_response_diagnostics(
             )
     except Exception as exc:
         target_logger.debug("Failed to extract or log HTTP response diagnostics: %s", exc)
-
-

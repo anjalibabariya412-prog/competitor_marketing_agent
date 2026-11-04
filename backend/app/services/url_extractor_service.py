@@ -279,10 +279,10 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
     pricing_keywords = {
         "pricing", "prices", "price", "plans", "packages", "rates",
         "subscription", "subscriptions", "fees", "cost", "tier", "tiers",
-        "membership", "memberships",
+        "membership", "memberships", "gold", "club", "vip", "loyalty", "rewards",
     }
     if any(k in path_tokens for k in pricing_keywords) or any(
-        k in text for k in ("pricing", "plans", "rates", "subscription", "subscriptions", "packages", "membership", "memberships")
+        k in text for k in ("pricing", "plans", "rates", "subscription", "subscriptions", "packages", "membership", "memberships", "gold membership", "vip")
     ):
         return PageType.PRICING
 
@@ -327,9 +327,10 @@ def classify_page_type(url: str, link_text: str = "") -> PageType:
         "offer", "offers", "deals", "deal", "discount", "discounts",
         "promo", "promotions", "specials", "special", "coupons", "coupon",
         "sale", "clearance", "bundle", "bundles", "voucher", "vouchers", "combos", "combo",
+        "bogo", "cashback", "savings", "rewards",
     }
     if any(k in path_tokens for k in offer_keywords) or any(
-        k in text for k in ("special offer", "deals", "discounts", "promotions", "sale", "clearance", "bundle", "bundles", "coupons", "combos")
+        k in text for k in ("special offer", "deals", "discounts", "promotions", "sale", "clearance", "bundle", "bundles", "coupons", "combos", "bogo", "cashback", "savings")
     ):
         return PageType.OFFER
 

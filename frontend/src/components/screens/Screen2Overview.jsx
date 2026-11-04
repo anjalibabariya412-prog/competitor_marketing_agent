@@ -271,10 +271,14 @@ export function Screen2Overview({ rawResponse, onBack }) {
               <p className="audience-lead-text">
                 {audience?.description || 'Target customer profile derived from your business offerings and website messaging.'}
               </p>
-              {audience?.provenance?.hasConflict && (
+              {(audience?.provenance?.hasConflict || audience?.hasConflict || audience?.conflictReason) && (
                 <div className="conflict-notice-pill">
-                  <ShieldAlertIcon size="sm" />
-                  <span>Conflicting audience information detected on site</span>
+                  <ShieldAlertIcon size="sm" aria-hidden="true" focusable="false" />
+                  <span>
+                    {audience?.conflictReason
+                      ? `Discrepancy: ${audience.conflictReason}`
+                      : 'Conflicting audience information detected on site'}
+                  </span>
                 </div>
               )}
             </div>

@@ -127,7 +127,7 @@ export function Screen1Loading({
             ) : (
               <p className="loading-box-desc">
                 Reviewing website pages and extracting offerings, value propositions, and customer profiles.
-                This typically takes around 25–35 seconds.
+                This typically takes 15–45 seconds depending on website responsiveness.
               </p>
             )}
 

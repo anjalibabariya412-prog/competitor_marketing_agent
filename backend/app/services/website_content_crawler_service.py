@@ -41,9 +41,14 @@ from backend.app.core.config import settings
 from backend.app.schemas.enums import PageType
 from backend.app.schemas.scraped_data import ScrapedPage
 from backend.app.services.content_validation import (
+    clean_boilerplate,
+    clear_domain_http_blocks,
+    extract_structured_fallback_text,
     is_blocked_content,
     is_content_adequate,
+    is_domain_http_blocked,
     log_http_response_diagnostics,
+    mark_domain_http_blocked,
 )
 from .page_selection_service import (
     PageSelectionResult,
@@ -583,6 +588,139 @@ def _normalize_target_url(url: str) -> str | None:
         return None
 
 
+def _normalize_domain_host(url: str) -> str:
+    """Extract lowercase host stripped of www. prefix for caching and block checks."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        netloc = (parsed.netloc or parsed.path).lower()
+        if ":" in netloc:
+            netloc = netloc.split(":", 1)[0]
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc.strip()
+    except Exception:
+        return ""
+
+
+@dataclass
+class _ScrapeCacheEntry:
+    cached_at: float
+    result: WebsiteCrawlResult
+
+
+_SCRAPE_CACHE: dict[str, _ScrapeCacheEntry] = {}
+
+
+def _is_scrape_cache_enabled() -> bool:
+    try:
+        val = getattr(settings, "SCRAPE_CACHE_ENABLED", True)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, str)):
+            return str(val).lower() in ("true", "1", "yes")
+        return False
+    except Exception:
+        return False
+
+
+def _build_crawl_cache_key(url: str, target_urls: Sequence[str] | None = None) -> str:
+    host = _normalize_domain_host(url)
+    if not host:
+        return ""
+    # Include normalized path root of base url if regional prefix present
+    parsed_base = urllib.parse.urlsplit(url)
+    base_path_root = parsed_base.path.strip("/").split("/")[0].lower() if parsed_base.path.strip("/") else ""
+    key_prefix = f"{host}/{base_path_root}" if base_path_root in ("en-us", "us", "in", "en-in", "uk", "en-gb", "ca", "en-ca", "au", "en-au") else host
+
+    if not target_urls:
+        return key_prefix
+    norm_urls = sorted([
+        _normalize_domain_host(u) + (urllib.parse.urlsplit(u).path.lower().rstrip("/") or "/")
+        for u in target_urls if u
+    ])
+    return f"{key_prefix}::" + ",".join(norm_urls)
+
+
+def get_cached_crawl(url: str, target_urls: Sequence[str] | None = None) -> WebsiteCrawlResult | None:
+    """Retrieve cached WebsiteCrawlResult if enabled and unexpired."""
+    try:
+        if not _is_scrape_cache_enabled():
+            return None
+        host = _normalize_domain_host(url)
+        if not host:
+            return None
+
+        cache_key = _build_crawl_cache_key(url, target_urls)
+        entry = _SCRAPE_CACHE.get(cache_key)
+
+        # Only allow fuzzy domain lookup if target_urls was not explicitly requested
+        if entry is None and target_urls is None:
+            prefix = f"{host}::"
+            for k, e in list(_SCRAPE_CACHE.items()):
+                if k == host or k.startswith(prefix):
+                    entry = e
+                    cache_key = k
+                    break
+
+        if entry is None:
+            return None
+        ttl_hours = 24.0
+        try:
+            ttl_hours = float(getattr(settings, "SCRAPE_CACHE_TTL_HOURS", 24))
+        except (TypeError, ValueError):
+            ttl_hours = 24.0
+        ttl_seconds = ttl_hours * 3600.0
+        if (time.time() - entry.cached_at) > ttl_seconds:
+            _SCRAPE_CACHE.pop(cache_key, None)
+            return None
+        logger.info(
+            "[SCRAPE_CACHE] Cache hit for '%s' (cached %.1f hours ago, %d pages). Reusing cached crawl result.",
+            cache_key,
+            (time.time() - entry.cached_at) / 3600.0,
+            len(entry.result.scraped_pages),
+        )
+        return entry.result
+    except Exception as exc:
+        logger.debug("Scrape cache lookup error: %s", exc)
+        return None
+
+
+def set_cached_crawl(url: str, result: WebsiteCrawlResult, target_urls: Sequence[str] | None = None) -> None:
+    """Cache successful WebsiteCrawlResult for the domain and requested URLs."""
+    try:
+        if not _is_scrape_cache_enabled():
+            return
+        if not result or not result.has_usable_content or result.status != "success":
+            return
+        if not result.scraped_pages:
+            return
+
+        # Do not cache runs dominated by inadequate or extremely sparse pages (< MIN_PAGE_ADEQUACY_CHARS)
+        min_chars = getattr(settings, "MIN_PAGE_ADEQUACY_CHARS", 50)
+        usable_pages = [p for p in result.scraped_pages if p.content and len(p.content.strip()) >= min_chars]
+        if not usable_pages:
+            logger.info(
+                "[SCRAPE_CACHE] Not caching crawl for '%s': inadequate content quality (0 pages with >= %d chars).",
+                url,
+                min_chars,
+            )
+            return
+
+        cache_key = _build_crawl_cache_key(url, target_urls or [p.url for p in result.scraped_pages])
+        if cache_key:
+            _SCRAPE_CACHE[cache_key] = _ScrapeCacheEntry(cached_at=time.time(), result=result)
+            logger.info("[SCRAPE_CACHE] Cached successful crawl for '%s' (%d pages).", cache_key, len(result.scraped_pages))
+    except Exception as exc:
+        logger.debug("Scrape cache store error: %s", exc)
+
+
+def clear_scrape_cache() -> None:
+    """Clear in-memory scrape cache (used in tests or fresh resets)."""
+    _SCRAPE_CACHE.clear()
+
+
 def _clean_html_fragment(soup: BeautifulSoup) -> None:
     """Clean unwanted elements while preserving promotional text, hero sections, and content-rich forms.
 
@@ -746,7 +884,23 @@ def _extract_text_from_html(html_str: str) -> str:
                 continue
             deduped_lines.append(line)
 
-        return "\n".join(deduped_lines).strip()
+        cleaned_text = "\n".join(deduped_lines).strip()
+        cleaned_text = clean_boilerplate(cleaned_text)
+
+        min_fallback = 500
+        try:
+            min_fallback = int(getattr(settings, "MIN_FALLBACK_EXTRACT_CHARS", 500))
+        except (TypeError, ValueError):
+            min_fallback = 500
+
+        if len(cleaned_text) < min_fallback:
+            fallback = extract_structured_fallback_text(html_str)
+            if fallback:
+                if cleaned_text:
+                    return f"{cleaned_text}\n\n{fallback}".strip()
+                return fallback.strip()
+
+        return cleaned_text
     except Exception:
         return ""
 
@@ -754,26 +908,33 @@ def _extract_text_from_html(html_str: str) -> str:
 def _extract_best_content(item: dict[str, Any]) -> str:
     """Select the highest quality content representation from crawler dataset item.
 
-    Prefers clean Markdown if it contains sufficient content (>= MIN_PAGE_CONTENT_CHARS).
-    If Markdown is empty or sparse, falls back to text, content, or cleaned HTML.
-    Never concatenates representations to prevent duplication.
+    Prefers clean Markdown if it contains sufficient content (>= MIN_FALLBACK_EXTRACT_CHARS).
+    Cleans boilerplate, and if content is sparse, falls back to structured HTML extraction.
     """
-    markdown = (item.get("markdown") or "").strip()
-    text = (item.get("text") or "").strip()
-    content = (item.get("content") or "").strip()
+    markdown = clean_boilerplate((item.get("markdown") or "").strip())
+    text = clean_boilerplate((item.get("text") or "").strip())
+    content = clean_boilerplate((item.get("content") or "").strip())
     html = item.get("html") or ""
 
+    min_fallback = 500
+    try:
+        min_fallback = int(getattr(settings, "MIN_FALLBACK_EXTRACT_CHARS", 500))
+    except (TypeError, ValueError):
+        min_fallback = 500
+
     # 1. Preferred representation: markdown with sufficient length
-    if len(markdown) >= MIN_PAGE_CONTENT_CHARS:
+    if len(markdown) >= min_fallback:
         return markdown
 
     # 2. Candidate from direct text or content fields
     candidate = markdown or text or content
 
-    # 3. If candidate is too short (< MIN_PAGE_CONTENT_CHARS), check if HTML provides fuller content
+    # 3. If candidate is too short (< min_fallback), check if HTML provides fuller content
     if html:
         html_text = _extract_text_from_html(html).strip()
-        if len(html_text) >= MIN_PAGE_CONTENT_CHARS and len(html_text) > len(candidate):
+        if len(html_text) >= min_fallback and len(html_text) > len(candidate):
+            return html_text
+        if len(candidate) < MIN_PAGE_CONTENT_CHARS and html_text:
             return html_text
 
     # 4. Fallback to candidate if present, else whatever HTML text was recovered
@@ -901,22 +1062,53 @@ def _build_actor_input(
     Crucially configures ``maxCrawlDepth=0`` to ensure ONLY the requested startUrls
     are scraped, and no child links or site crawling occurs.
     """
-    page_timeout = min(max(timeout_seconds // len(urls), 20), 30) if urls else 30
+    page_timeout = 25
+    try:
+        page_timeout = int(getattr(settings, "CRAWLER_PAGE_LOAD_TIMEOUT_SECS", 25))
+    except (TypeError, ValueError):
+        page_timeout = 25
+
+    nav_timeout = 25
+    try:
+        nav_timeout = int(getattr(settings, "CRAWLER_NAVIGATION_TIMEOUT_SECS", 25))
+    except (TypeError, ValueError):
+        nav_timeout = 25
+
+    max_retries = 1
+    try:
+        max_retries = int(getattr(settings, "CRAWLER_MAX_REQUEST_RETRIES", 1))
+    except (TypeError, ValueError):
+        max_retries = 1
+
+    max_actor_concurrency = 6
+    try:
+        max_actor_concurrency = int(getattr(settings, "CRAWLER_MAX_CONCURRENCY_ACTOR", 6))
+    except (TypeError, ValueError):
+        max_actor_concurrency = 6
+
+    # When direct HTTP is already known to be blocked for this domain, skip adaptive HTTP probe
+    # and use 'playwright:chrome' directly to avoid doubling per-page latency.
+    crawler_type = "playwright:adaptive"
+    browser_only_on_block = getattr(settings, "CRAWLER_BROWSER_ONLY_ON_HTTP_BLOCK", True)
+    if browser_only_on_block and urls and any(is_domain_http_blocked(u) for u in urls):
+        crawler_type = "playwright:chrome"
+        logger.info("[CRAWLER_CONFIG] Domain is HTTP-blocked; configuring Actor with 'playwright:chrome' directly.")
+
     return {
         "startUrls": [{"url": u} for u in urls],
         # Depth 0 guarantees only startUrls are scraped; no child links are followed.
         "maxCrawlDepth": 0,
         "maxCrawlPages": len(urls),
-        "maxConcurrency": min(len(urls), 4),
-        "crawlerType": "playwright:adaptive",
+        "maxConcurrency": min(len(urls), max_actor_concurrency),
+        "crawlerType": crawler_type,
         "saveMarkdown": True,
         "saveHtml": False,
         "saveScreenshots": False,
         "removeElementsCssSelector": NOISE_REMOVAL_CSS_SELECTOR,
         "proxyConfiguration": {"useApifyProxy": True},
-        "maxRequestRetries": 1,
+        "maxRequestRetries": max_retries,
         "pageLoadTimeoutSecs": page_timeout,
-        "navigationTimeoutSecs": page_timeout,
+        "navigationTimeoutSecs": nav_timeout,
         "waitUntil": "domcontentloaded",
     }
 
@@ -999,6 +1191,18 @@ def _run_actor_sync(
                 f"Actor run '{run_id}' remained nonterminal ('{actor_status}') when the operation deadline ({timeout_seconds}s) expired."
             )
             logger.warning(err_msg)
+            dataset_id = (
+                getattr(run, "default_dataset_id", None)
+                or (run.get("defaultDatasetId") or run.get("default_dataset_id") if isinstance(run, dict) else None)
+            )
+            if dataset_id:
+                try:
+                    partial_items = list(client.dataset(dataset_id).iterate_items())
+                    if partial_items and any(isinstance(it, dict) for it in partial_items):
+                        logger.info("Recovered %d partial items from nonterminal run '%s'.", len(partial_items), run_id)
+                        return partial_items, run_id, err_msg, actor_status
+                except Exception as rec_exc:
+                    logger.debug("Could not recover partial items from dataset '%s': %s", dataset_id, rec_exc)
             return [], run_id, err_msg, actor_status
 
         # 2. Terminal status reached: retrieve dataset items
@@ -1339,6 +1543,11 @@ async def crawl_selected_pages(
         parsed = urllib.parse.urlsplit(first_norm_url)
         resolved_website_url = f"{parsed.scheme}://{parsed.netloc}"
 
+    # Check scrape cache before initiating fresh retrieval
+    cached_crawl = get_cached_crawl(resolved_website_url, list(valid_targets.keys()))
+    if cached_crawl is not None:
+        return cached_crawl
+
     total_requested = len(valid_targets)
 
     # 2. Check for empty candidate list
@@ -1390,8 +1599,25 @@ async def crawl_selected_pages(
     http_attempted_count: int = 0
     http_429_count: int = 0
 
-    if settings.HTTP_FIRST_RETRIEVAL:
-        max_concurrency = max(1, settings.HTTP_MAX_CONCURRENCY)
+    attempt_http = False
+    try:
+        attempt_http = bool(getattr(settings, "HTTP_FIRST_RETRIEVAL", True))
+    except Exception:
+        attempt_http = True
+
+    domain_blocked = is_domain_http_blocked(resolved_website_url)
+    if domain_blocked:
+        logger.info(
+            "[HTTP_FIRST] Domain '%s' was previously blocked (403/429/WAF). Skipping direct HTTP and routing %d page(s) straight to browser fallback.",
+            resolved_website_url,
+            len(valid_targets),
+        )
+        fallback_targets = dict(valid_targets)
+    elif attempt_http:
+        try:
+            max_concurrency = max(1, int(getattr(settings, "HTTP_MAX_CONCURRENCY", 2)))
+        except (TypeError, ValueError):
+            max_concurrency = 2
         logger.info(
             "Attempting HTTP-first retrieval for %d selected pages (max_concurrency=%d)...",
             len(valid_targets),
@@ -1457,6 +1683,8 @@ async def crawl_selected_pages(
                 )
 
                 # 5. Detect HTTP 429 and activate crawl-scoped stop signal
+                if diag and diag.http_status in (401, 403, 429):
+                    mark_domain_http_blocked(orig_u, f"internal_http_{diag.http_status}")
                 if diag and diag.http_status == 429:
                     http_429_count += 1
                     if not rate_limited_event.is_set():
@@ -1469,8 +1697,13 @@ async def crawl_selected_pages(
 
                 return success, page, diag, fb_reason
 
+        try:
+            http_timeout = float(getattr(settings, "HTTP_RETRIEVAL_TIMEOUT_SECONDS", 12.0))
+        except (TypeError, ValueError):
+            http_timeout = 12.0
+
         async with httpx.AsyncClient(
-            timeout=settings.HTTP_RETRIEVAL_TIMEOUT_SECONDS,
+            timeout=http_timeout,
             follow_redirects=True,
             headers=http_headers,
             verify=True,
@@ -1543,7 +1776,7 @@ async def crawl_selected_pages(
             len(immediate_failures),
             exec_time,
         )
-        return WebsiteCrawlResult(
+        http_result = WebsiteCrawlResult(
             website_url=resolved_website_url,
             status=overall_status,
             scraped_pages=http_successes,
@@ -1562,6 +1795,9 @@ async def crawl_selected_pages(
             browser_fallback_requested=0,
             browser_fallback_succeeded=0,
         )
+        if overall_status == "success" and bool(http_successes):
+            set_cached_crawl(resolved_website_url, http_result, list(valid_targets.keys()))
+        return http_result
 
     # 4. Validate Apify API token from settings for fallback targets
     if not settings.APIFY_API_TOKEN:
@@ -1676,6 +1912,12 @@ async def crawl_selected_pages(
     actor_input = _build_actor_input(urls_to_scrape, timeout_seconds=timeout_seconds)
 
     # 6. Execute Actor with transient retries
+    hard_timeout = timeout_seconds
+    try:
+        hard_timeout = max(60, min(timeout_seconds, int(getattr(settings, "CRAWLER_HARD_TIMEOUT_SECONDS", 90))))
+    except (TypeError, ValueError):
+        hard_timeout = timeout_seconds
+
     items: list[dict[str, Any]] = []
     actor_run_id: str | None = None
     last_error: str | None = None
@@ -1683,16 +1925,17 @@ async def crawl_selected_pages(
 
     for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
         logger.info(
-            "Executing website content crawler (attempt %d/%d) for %d URLs...",
+            "Executing website content crawler (attempt %d/%d) for %d URLs (timeout=%ds)...",
             attempt,
             MAX_TRANSIENT_RETRIES,
             len(urls_to_scrape),
+            hard_timeout,
         )
         sync_res = await asyncio.to_thread(
             _run_actor_sync,
             raw_token,
             actor_input,
-            timeout_seconds,
+            hard_timeout,
         )
         if len(sync_res) >= 4:
             items, run_id, last_error, actor_final_status = sync_res[:4]
@@ -2110,7 +2353,7 @@ async def crawl_selected_pages(
         len(browser_scraped_pages),
     )
 
-    return WebsiteCrawlResult(
+    crawl_result = WebsiteCrawlResult(
         website_url=resolved_website_url,
         status=overall_status,
         scraped_pages=scraped_pages,
@@ -2130,6 +2373,9 @@ async def crawl_selected_pages(
         browser_fallback_requested=len(fallback_targets),
         browser_fallback_succeeded=len(browser_scraped_pages),
     )
+    if overall_status == "success" and has_usable_content:
+        set_cached_crawl(resolved_website_url, crawl_result, list(valid_targets.keys()))
+    return crawl_result
 
 
 # Backward-compatible alias

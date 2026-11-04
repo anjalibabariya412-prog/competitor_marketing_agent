@@ -21,7 +21,9 @@ Key Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 import urllib.parse
 from typing import Any, Literal, Sequence
@@ -36,6 +38,7 @@ from backend.app.agent.prompts.business_overview import (
 from backend.app.core.config import settings
 from backend.app.schemas.enums import OfferingType, PageType, PriceAvailability
 from backend.app.schemas.scraped_data import ScrapedPage
+from backend.app.services.content_validation import evaluate_page_content_quality
 from .website_content_crawler_service import WebsiteCrawlResult
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum total characters required across all pages to warrant an LLM generation call
 MIN_TOTAL_CONTENT_CHARS: int = 150
+MIN_USABLE_PAGE_CHARS: int = 300
 
 # Request timeout for OpenAI LLM call
 DEFAULT_LLM_TIMEOUT_SECONDS: float = 60.0
@@ -269,26 +273,37 @@ def _extract_usable_pages(
 ) -> tuple[list[ScrapedPage], str]:
     """Extract and validate non-empty ScrapedPage models and infer the base website URL.
 
-    Filters out empty pages with zero readable text content.
+    Filters out empty pages with zero readable text content. Strips boilerplate notices.
 
     Returns:
         (usable_pages, website_url)
     """
+    from backend.app.services.content_validation import clean_boilerplate
+
     usable_pages: list[ScrapedPage] = []
     website_url: str = ""
 
+    raw_pages: list[ScrapedPage] = []
     if isinstance(crawl_input, WebsiteCrawlResult):
         website_url = crawl_input.website_url
-        for page in crawl_input.scraped_pages:
-            if page.content and page.content.strip():
-                usable_pages.append(page)
+        raw_pages = list(crawl_input.scraped_pages)
     elif isinstance(crawl_input, Sequence):
         for item in crawl_input:
-            if isinstance(item, ScrapedPage) and item.content and item.content.strip():
-                usable_pages.append(item)
+            if isinstance(item, ScrapedPage):
+                raw_pages.append(item)
                 if not website_url and item.url:
                     parsed = urllib.parse.urlsplit(item.url)
                     website_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    for page in raw_pages:
+        if page.content and page.content.strip():
+            cleaned = clean_boilerplate(page.content)
+            # Use cleaned content if not empty, otherwise preserve original
+            if cleaned:
+                page.content = cleaned
+                usable_pages.append(page)
+            elif page.content.strip():
+                usable_pages.append(page)
 
     return usable_pages, website_url
 
@@ -298,8 +313,8 @@ def _format_pages_for_prompt(
 ) -> tuple[str, list[ScrapedPage]]:
     """Format complete scraped page content for the LLM prompt.
 
-    Iterates over usable pages with non-empty content and formats each page
-    with its URL, title, page type, and complete un-truncated content.
+    Separates full substantive pages from weak-signal pages (< MIN_USABLE_PAGE_CHARS)
+    to prevent hallucinations while preserving all recovered context.
 
     Returns:
         (formatted_pages_text, included_pages)
@@ -311,10 +326,36 @@ def _format_pages_for_prompt(
     if not usable:
         return "", []
 
+    min_usable = 300
+    try:
+        min_usable = int(getattr(settings, "MIN_USABLE_PAGE_CHARS", 300))
+    except (TypeError, ValueError):
+        min_usable = 300
+
     formatted_chunks: list[str] = []
     included_pages: list[ScrapedPage] = []
 
+    primary_pages: list[tuple[int, ScrapedPage]] = []
+    weak_signal_pages: list[tuple[int, ScrapedPage, str]] = []
+    accumulated_texts: list[str] = []
+
     for idx, page in enumerate(usable, start=1):
+        quality, reason = evaluate_page_content_quality(
+            page.content,
+            page_type=page.page_type,
+            existing_texts=accumulated_texts,
+            url=page.url or "",
+        )
+        if quality == "primary":
+            primary_pages.append((idx, page))
+            accumulated_texts.append(page.content)
+        else:
+            weak_signal_pages.append((idx, page, reason))
+            if len(page.content.strip()) >= 100:
+                accumulated_texts.append(page.content)
+
+    # 1. Format full primary pages
+    for idx, page in primary_pages:
         title_str = f" | Title: {page.title.strip()}" if page.title and page.title.strip() else ""
         type_str = f" | Type: {page.page_type.value}" if hasattr(page.page_type, "value") else ""
         header = f"--- Page {idx}: {page.url}{title_str}{type_str} ---"
@@ -324,17 +365,206 @@ def _format_pages_for_prompt(
         formatted_chunks.append(chunk)
         included_pages.append(page)
 
+    # 2. Format weak-signal pages (partial / duplicate / limited content)
+    for idx, page, reason in weak_signal_pages:
+        title_str = f" | Title: {page.title.strip()}" if page.title and page.title.strip() else ""
+        type_str = f" | Type: {page.page_type.value}" if hasattr(page.page_type, "value") else ""
+        header = f"--- Page {idx}: {page.url}{title_str}{type_str} ---"
+
+        page_text = page.content.strip()
+        warning = f"[Weak Signal: Partial content ({reason}). Treat as limited evidence; do not extrapolate missing facts.]"
+        chunk = f"{header}\n{warning}\n{page_text}\n"
+        formatted_chunks.append(chunk)
+        included_pages.append(page)
 
     final_formatted = "\n".join(formatted_chunks)
 
     logger.info(
-        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars).",
+        "[business_overview_trace] [CHECKPOINT 2: format_pages] Formatted prompt: included=%d/%d pages (%d chars, primary=%d, weak=%d).",
         len(included_pages),
         len(pages),
-        len(final_formatted)
+        len(final_formatted),
+        len(primary_pages),
+        len(weak_signal_pages),
     )
-    
+
     return final_formatted, included_pages
+
+
+# ---------------------------------------------------------------------------
+# Regional / Geo Context Detection & Emergency Synthesis
+# ---------------------------------------------------------------------------
+
+_REGIONAL_PREFIX_MAP: dict[str, str] = {
+    "en-us": "United States (US)",
+    "us": "United States (US)",
+    "en-in": "India (IN)",
+    "in": "India (IN)",
+    "en-gb": "United Kingdom (UK)",
+    "uk": "United Kingdom (UK)",
+    "gb": "United Kingdom (UK)",
+    "en-ca": "Canada (CA)",
+    "ca": "Canada (CA)",
+    "en-au": "Australia (AU)",
+    "au": "Australia (AU)",
+    "en-de": "Germany (DE)",
+    "de": "Germany (DE)",
+    "en-fr": "France (FR)",
+    "fr": "France (FR)",
+}
+
+_REGIONAL_TLD_MAP: dict[str, str] = {
+    ".in": "India (IN)",
+    ".co.in": "India (IN)",
+    ".co.uk": "United Kingdom (UK)",
+    ".ca": "Canada (CA)",
+    ".com.au": "Australia (AU)",
+    ".au": "Australia (AU)",
+    ".de": "Germany (DE)",
+    ".fr": "France (FR)",
+}
+
+
+def detect_regional_context(
+    website_url: str,
+    pages: Sequence[ScrapedPage],
+    business_form: Any = None,
+) -> str | None:
+    """Detect regional market/geo context from URL path prefixes or ccTLDs.
+
+    Distinguishes proxy-induced /en-us redirects from genuine target markets by
+    cross-referencing with user intake data.
+    """
+    all_urls = [website_url] + [p.url for p in pages if p.url]
+
+    # Extract user intake regional indicators
+    intake_text = ""
+    if business_form:
+        if hasattr(business_form, "business_name_and_description"):
+            intake_text = f"{getattr(business_form, 'business_name_and_description', '')} {getattr(business_form, 'target_audience', '')} {getattr(business_form, 'product_or_service', '')}".lower()
+        elif isinstance(business_form, dict):
+            intake_text = f"{business_form.get('business_name_and_description', '')} {business_form.get('target_audience', '')} {business_form.get('product_or_service', '')}".lower()
+
+    user_is_india = any(
+        kw in intake_text
+        for kw in ("india", "indian", "inr", "₹", "delhi", "mumbai", "bangalore", "bengaluru", "gurgaon", "hyderabad", "chennai")
+    )
+    domain_is_india = any(website_url.lower().endswith(t) for t in (".in", ".co.in")) or ".in/" in website_url.lower()
+
+    # Check path prefixes first (e.g. /en-us/, /in/)
+    for u in all_urls:
+        try:
+            parsed = urllib.parse.urlsplit(u)
+            path_parts = [seg.lower() for seg in parsed.path.split("/") if seg]
+            if path_parts:
+                first_seg = path_parts[0]
+                if first_seg in _REGIONAL_PREFIX_MAP:
+                    region_desc = _REGIONAL_PREFIX_MAP[first_seg]
+                    if (user_is_india or domain_is_india) and first_seg in ("en-us", "us"):
+                        return (
+                            "Regional / Geo Context: Website redirected to /en-us (observed scraper proxy redirect), "
+                            "while user business profile indicates India / domestic target market. Prioritize the user "
+                            "business profile for primary market, currency (INR/₹), and domestic audience, while noting "
+                            "the /en-us international storefront."
+                        )
+                    return (
+                        f"Regional / Geo Context: Website content indicates targeting for {region_desc} "
+                        f"(detected '{first_seg}' in URL path). Take this into account for pricing currency, "
+                        "market availability, and target audience."
+                    )
+        except Exception:
+            continue
+
+    # Check ccTLD
+    for u in all_urls:
+        try:
+            parsed = urllib.parse.urlsplit(u)
+            netloc = parsed.netloc.lower()
+            for tld, region_desc in _REGIONAL_TLD_MAP.items():
+                if netloc.endswith(tld):
+                    return (
+                        f"Regional / Geo Context: Website domain indicates targeting for {region_desc} "
+                        f"(detected ccTLD '{tld}'). Take this into account for pricing currency, "
+                        "market availability, and target audience."
+                    )
+        except Exception:
+            continue
+
+    return None
+
+
+def synthesize_emergency_overview(
+    business_form: Any,
+    website_url: str,
+    reason: str = "Crawled content was insufficient or blocked.",
+) -> BusinessOverview:
+    """Synthesize a best-effort emergency overview strictly from user intake when website crawling yields insufficient content."""
+    name_desc = ""
+    product = ""
+    audience = ""
+    if hasattr(business_form, "business_name_and_description"):
+        name_desc = business_form.business_name_and_description or ""
+        product = business_form.product_or_service or ""
+        audience = business_form.target_audience or ""
+    elif isinstance(business_form, dict):
+        name_desc = business_form.get("business_name_and_description", "")
+        product = business_form.get("product_or_service", "")
+        audience = business_form.get("target_audience", "")
+
+    # Derive name
+    business_name = name_desc.split(" - ")[0].split(". ")[0].strip() if name_desc else "Business"
+    if len(business_name) > 60:
+        business_name = business_name[:60]
+
+    products: list[ProductServiceItem] = []
+    if product:
+        products.append(
+            ProductServiceItem(
+                name=product,
+                offering_type=OfferingType.PRODUCT,
+                description=f"Primary product or service identified from user intake: {product}",
+                source_url=None,
+                source_urls=[],
+            )
+        )
+
+    target_aud = TargetAudienceInfo(
+        description=audience or "Target audience derived from business intake; website verification unavailable.",
+        is_explicit=False,
+        source_url=None,
+        user_stated_audience=audience or None,
+        has_conflict=False,
+    )
+
+    value_props: list[ValueProposition] = []
+    if name_desc:
+        value_props.append(
+            ValueProposition(
+                statement=name_desc,
+                is_explicit=False,
+                source_url=None,
+                source_urls=[],
+            )
+        )
+
+    gaps = [
+        InformationGap(
+            category="Website Content Acquisition",
+            observation=f"Detailed website pages could not be analyzed ({reason}). Overview synthesized with limited confidence from business intake.",
+        )
+    ]
+
+    return BusinessOverview(
+        business_name=business_name,
+        website_url=website_url or "https://unknown.com",
+        business_description=name_desc or f"Business operating at {website_url}.",
+        products_and_services=products,
+        target_audience=target_aud,
+        positioning_and_value_propositions=value_props,
+        conflicts=[f"Emergency synthesis: {reason}"],
+        information_gaps=gaps,
+        sources_used=[],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +934,25 @@ async def generate_business_overview(
             f"Insufficient readable website content ({total_content_length} chars across "
             f"{len(usable_pages)} pages; minimum required is {MIN_TOTAL_CONTENT_CHARS})."
         )
+        enable_emergency = getattr(settings, "ENABLE_EMERGENCY_OVERVIEW", False)
+        if isinstance(enable_emergency, bool) and enable_emergency and business_form:
+            logger.info("Triggering emergency overview synthesis from user intake context.")
+            emergency_overview = synthesize_emergency_overview(
+                business_form=business_form,
+                website_url=resolved_website_url,
+                reason=msg,
+            )
+            return BusinessOverviewResult(
+                status="success",
+                business_overview=emergency_overview,
+                website_url=resolved_website_url,
+                total_pages_analyzed=len(usable_pages),
+                total_findings=len(emergency_overview.products_and_services) + len(emergency_overview.positioning_and_value_propositions),
+                model_used="emergency_fallback",
+                execution_time_seconds=round(time.perf_counter() - start_time, 2),
+                error_message=f"Synthesized emergency overview: {msg}",
+            )
+
         logger.warning(
             "Cannot generate business overview for %s: %s",
             resolved_website_url,
@@ -792,6 +1041,12 @@ async def generate_business_overview(
     elif audience_unknown:
         intake_parts.append("- Stated Target Audience: Not specified by user (audience_unknown=True)")
 
+    enable_geo = getattr(settings, "ENABLE_REGIONAL_CONTEXT_DETECTION", True)
+    if isinstance(enable_geo, bool) and enable_geo:
+        geo_note = detect_regional_context(resolved_website_url, usable_pages, business_form=business_form)
+        if geo_note:
+            intake_parts.append(f"- {geo_note}")
+
     user_intake_context = "\n".join(intake_parts) if intake_parts else "No user intake provided; derive strictly from crawled content."
     product_focus = stated_product if stated_product else "Core commercial offerings"
 
@@ -848,6 +1103,37 @@ async def generate_business_overview(
         )
 
         parsed_overview: BusinessOverview | None = completion.choices[0].message.parsed
+        if parsed_overview is None:
+            raw_content = getattr(completion.choices[0].message, "content", None) or ""
+            if raw_content:
+                logger.warning("Structured parse returned None; attempting JSON repair on raw message content.")
+                try:
+                    json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
+                    if json_match:
+                        raw_json = json.loads(json_match.group(0))
+                        parsed_overview = BusinessOverview.model_validate(raw_json)
+                        logger.info("Successfully recovered BusinessOverview via local JSON repair from raw content.")
+                except Exception as repair_exc:
+                    logger.warning("Local JSON extraction failed: %s", repair_exc)
+
+            enable_repair = getattr(settings, "ENABLE_JSON_REPAIR_RETRY", True)
+            if parsed_overview is None and isinstance(enable_repair, bool) and enable_repair and raw_content:
+                try:
+                    logger.info("Sending single repair prompt to OpenAI to recover valid BusinessOverview JSON.")
+                    repair_completion = await client.beta.chat.completions.parse(
+                        model=resolved_model,
+                        messages=[
+                            {"role": "system", "content": "You are a JSON repair assistant. Output ONLY valid JSON adhering strictly to the BusinessOverview schema."},
+                            {"role": "user", "content": f"The following JSON response was invalid or malformed. Repair it so it strictly parses as valid BusinessOverview JSON:\n\n{raw_content}"},
+                        ],
+                        response_format=BusinessOverview,
+                    )
+                    parsed_overview = repair_completion.choices[0].message.parsed
+                    if parsed_overview:
+                        logger.info("Successfully recovered BusinessOverview via LLM repair retry.")
+                except Exception as llm_repair_exc:
+                    logger.warning("LLM repair retry failed: %s", llm_repair_exc)
+
         if parsed_overview is None:
             err = "OpenAI returned an empty or unparseable structured response."
             logger.error(err)

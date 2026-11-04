@@ -36,6 +36,7 @@ from backend.app.services.content_validation import (
     is_blocked_content,
     is_content_adequate,
     log_http_response_diagnostics,
+    mark_domain_http_blocked,
 )
 
 logger = logging.getLogger(__name__)
@@ -614,6 +615,7 @@ async def _fetch_homepage_impl(
 
                 if resp_code == 200 and resp_text:
                     if _is_blocked_html(resp_text) or is_blocked_content(resp_text):
+                        mark_domain_http_blocked(normalized_url, "homepage_waf_challenge")
                         logger.warning(
                             "[HTTP_FIRST] Homepage %s received HTTP 200 but content indicates WAF/CAPTCHA challenge. "
                             "Falling back to Playwright scraper.",
@@ -656,6 +658,8 @@ async def _fetch_homepage_impl(
                                 len(clean_txt),
                             )
                 else:
+                    if resp_code in (401, 403, 429):
+                        mark_domain_http_blocked(normalized_url, f"homepage_http_{resp_code}")
                     log_http_response_diagnostics(
                         resp,
                         stage="homepage",
